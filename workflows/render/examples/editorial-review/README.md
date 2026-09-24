@@ -47,7 +47,16 @@ To exercise failure reporting, select the demonstration-failure checkbox. To can
 
 ## Optional real agents
 
-Set `REVIEW_MODE=agent`, `REVIEW_MODEL` to a model ID supported by the pinned Mastra version, and that model provider's credentials in the worker environment. Restart both processes with the same updated build identity. The same graph then calls worker-local `reviewer` and `editor` Mastra agents with structured output. A child retry can repeat a model call and its cost. Paid model execution has not been run as part of local verification.
+Set `REVIEW_MODE=agent`, `REVIEW_MODEL` to a model ID supported by the pinned Mastra version, and that model provider's credentials in the worker environment. Restart both processes with the same updated build identity. The same graph then calls worker-local `reviewer` and `editor` Mastra agents with structured output. A child retry can repeat a model call and its cost. Hosted real-agent generation with `openai/gpt-4.1-mini` passed on 24 September 2026; see the [validation record](../../docs/hosted-validation.md).
+
+To exercise the live-agent path on your deployed service, set `DEMO_BASE_URL` and `DEMO_TEST_TOKEN` in your local test environment and run from the integration package directory:
+
+```sh
+TMPDIR="$PWD/.scratch/tmp" TSX_DISABLE_CACHE=1 \
+  node node_modules/tsx/dist/cli.mjs scripts/hosted-agent-smoke.ts
+```
+
+This submits one job with three real reviewer calls and one editor call. It refuses deterministic mode and checks structured findings, a changed revision and preservation of the fixture's key facts. Model requests and child retries can incur charges. Set `DEMO_RESULTS_FILE` to retain the synthetic input and output. The script prints the run ID before submission; set `DEMO_AGENT_RUN_ID` to that same ID when reconnecting after an interrupted test. Check native Render run records separately to verify the root and four child tasks. See [hosted validation](../../docs/hosted-validation.md) for observed results and limits.
 
 ## Boundaries
 

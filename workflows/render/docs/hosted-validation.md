@@ -1,10 +1,10 @@
 # Hosted validation
 
-Hosted validation passed on 23 September 2026 (24 September UTC) in the `samples` Render workspace, using a dedicated Workflow service, web example and PostgreSQL database. Two defects found by hosted tests were fixed before the final passing run. The example used deterministic mode and made no model calls.
+Hosted validation passed in the `samples` Render workspace, using a dedicated Workflow service, web example and PostgreSQL database. Deterministic lifecycle checks passed on 23 September 2026 (24 September UTC), after fixing two hosted defects. A real Mastra agent workflow using OpenAI GPT-4.1 mini passed on 24 September 2026. The live example is now configured in agent mode.
 
 The fork branch is `feat/render-workflows`. Deployment configuration is confined to this package.
 
-## Deployment and results
+## Deterministic deployment and results
 
 - Tested application commit: `d1e31106f37626076ce9e70805948742491f7cb0`.
 - Workflow: `wfl-daq7jmh42hec738ka3c0`, version `wfv-daq7s3p42hec738lcmn0`, status `ready`.
@@ -36,13 +36,42 @@ Key run identities:
 
 [Machine-readable observations](hosted-results.json) retain native child IDs and attempt counts. An additional diagnostic subscribed only after completion and received no historical event within 30 seconds. Do not assume event replay; the provider checks status before subscribing and falls back to polling after a bounded wait.
 
+## Real-agent validation
+
+The same application code at `d1e31106f37626076ce9e70805948742491f7cb0` completed a real-agent job on hosted Render. The example's Mastra `reviewer` agent performed three parallel `generate()` calls, followed by the `editor` agent's `generate()` call. All used `openai/gpt-4.1-mini` and structured output. The provider source needed no changes for this test.
+
+| Identity | Value |
+| --- | --- |
+| Application build ID | `d1e31106-agent-gpt-4.1-mini-v2` |
+| Workflow version | `wfv-daqj3k2d0e5s73ap1hfg` |
+| Web deploy | `dep-daqj3k8473hc738bikgg` |
+| Mastra run | `5d0f192c-c446-4b8b-bb3f-1145bbe5039a` |
+| Render root | `trn-08l4gdaqj5gojo6nc73ekttd0` |
+
+The root and all four children completed on their first attempt. Native child results matched the three findings and final revision returned through the application API. The generated revision preserved the opening year, day, time, free clinic and no-ticket requirement while removing repetition:
+
+> Our museum, opened in 1998, offers a free repair clinic every Friday at 3 p.m. No tickets are required to attend.
+
+The first credential tested could list models but had no credits for generation. That job failed and the application surfaced the provider error correctly. An existing credential supplied from the authorized Render workspace passed a small real Mastra generation preflight and then the full hosted workflow. No key value was printed, committed or saved to local test files. `OPENAI_API_KEY` is configured only on the worker; `RENDER_API_KEY` remains only on the web caller.
+
+The `agent` section of [hosted-results.json](hosted-results.json) retains the synthetic input, generated findings/revision, task IDs and attempts. This is evidence for one real structured-generation workflow, not a model-quality benchmark. Agent tool loops, memory, streaming and other model providers were not exercised.
+
+To repeat, set matching `REVIEW_MODE=agent`, `REVIEW_MODEL=openai/gpt-4.1-mini` and a new immutable `APP_BUILD_ID` on caller and worker. Configure the OpenAI key on the worker, release the worker and deploy the web service. With `DEMO_BASE_URL`, `DEMO_TEST_TOKEN` and optionally `DEMO_RESULTS_FILE` set locally, run:
+
+```sh
+TMPDIR="$PWD/.scratch/tmp" TSX_DISABLE_CACHE=1 \
+  node node_modules/tsx/dist/cli.mjs scripts/hosted-agent-smoke.ts
+```
+
+The test makes real model calls and refuses deterministic mode. Reuse its printed ID through `DEMO_AGENT_RUN_ID` after a client interruption; do not blindly submit another paid job.
+
 ## Test environment lifetime and remaining limits
 
 The temporary caller API credential expires on **25 September 2026 at 16:59 UTC**. Replace `RENDER_API_KEY` on the web service and redeploy before relying on ongoing submissions. The worker needs no such credential. The demo login uses a tester token from the web service's `DEMO_API_TOKENS`; tokens are deliberately absent from the repository and this report.
 
 The free PostgreSQL test instance expires on **24 October 2026**. The free web service can sleep when idle. Auto-deploy is disabled on both services so later documentation commits do not change the tested application version. This is a temporary test deployment, not a production service.
 
-These checks do not prove durable root replay, hosted root crash/timeout recovery, deploy transitions during active runs, workspace quota behavior, ambiguous submission recovery, production authentication/retention, paid model behavior or full Studio compatibility. Root retries remain zero, as documented in the package README.
+These checks do not prove durable root replay, hosted root crash/timeout recovery, deploy transitions during active runs, workspace quota behavior, ambiguous submission recovery, production authentication/retention, model quality across workloads or full Studio compatibility. Root retries remain zero, as documented in the package README.
 
 ## Reproducible build
 
