@@ -149,6 +149,6 @@ Generated root/step definitions are internal protocol endpoints. Starting one di
 
 See [the editorial review app](examples/editorial-review/README.md) for a complete asynchronous browser/backend/worker example. It defaults to deterministic feedback with no model calls; optional agent mode requires explicit model configuration. Refresh/reconnect, ownership checks, failure reporting and real cancellation are part of the example.
 
-See [verification instructions](docs/verification.md) for unit/type checks, real Render CLI subprocess tests, PostgreSQL lifecycle tests and package-consumer checks. See [upstream follow-up](docs/upstream.md) for work intentionally deferred by the package-only repository boundary.
+See [verification instructions](docs/verification.md) for unit/type checks, real Render CLI subprocess tests, PostgreSQL lifecycle tests and package-consumer checks. See [hosted validation](docs/hosted-validation.md) for real Render task execution, retry and cancellation evidence, and [upstream follow-up](docs/upstream.md) for work intentionally deferred by the package-only repository boundary.
 
 Reference documentation: [Render Workflows](https://render.com/docs/workflows), [defining tasks](https://render.com/docs/workflows-defining), [TypeScript SDK](https://render.com/docs/workflows-sdk-typescript), [execution limits](https://render.com/docs/workflows-limits).

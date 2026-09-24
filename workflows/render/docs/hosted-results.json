@@ -1,0 +1,143 @@
+{
+  "validatedAt": "2026-09-24T01:39:56.101Z",
+  "deployedCommit": "d1e31106f37626076ce9e70805948742491f7cb0",
+  "workspace": "samples",
+  "workflowId": "wfl-daq7jmh42hec738ka3c0",
+  "workflowVersionId": "wfv-daq7s3p42hec738lcmn0",
+  "serviceId": "srv-daq7jrh7lnhs73bvkco0",
+  "deployId": "dep-daq7s3tg1s2s73fflkb0",
+  "serviceUrl": "https://mastra-render-integration-test-web.onrender.com",
+  "tests": {
+    "unitTestsPassed": 39,
+    "typecheck": "passed",
+    "packagedBuild": "passed"
+  },
+  "native": [
+    {
+      "check": "parallel task overlap",
+      "milliseconds": 4830
+    },
+    {
+      "scenario": "success",
+      "mastraRunId": "be38ef29-76d5-43ff-a764-6c5cd6d112d7",
+      "rootTaskRunId": "trn-08l4gdaq7t75g1s2s73ffp8i0",
+      "status": "completed",
+      "children": [
+        {
+          "id": "trn-08l4gdaq7t9ada7k000a7bk10",
+          "task": "mastra-editorial-review-revise-f80a8a9c8b366e48",
+          "status": "completed",
+          "attempts": 1,
+          "parent": "trn-08l4gdaq7t75g1s2s73ffp8i0"
+        },
+        {
+          "id": "trn-08l4gdaq7t82da7k000a7bjug",
+          "task": "mastra-editorial-review-consistency-f36cc246e8520d33",
+          "status": "completed",
+          "attempts": 1,
+          "parent": "trn-08l4gdaq7t75g1s2s73ffp8i0"
+        },
+        {
+          "id": "trn-08l4gdaq7t82da7k000a7bju0",
+          "task": "mastra-editorial-review-structure-a7b2cf6c7d19b737",
+          "status": "completed",
+          "attempts": 1,
+          "parent": "trn-08l4gdaq7t75g1s2s73ffp8i0"
+        },
+        {
+          "id": "trn-08l4gdaq7t82da7k000a7bjtg",
+          "task": "mastra-editorial-review-clarity-a39fda532c78b343",
+          "status": "completed",
+          "attempts": 1,
+          "parent": "trn-08l4gdaq7t75g1s2s73ffp8i0"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "scenario": "failure",
+      "mastraRunId": "7806765c-a4a9-4e4d-9e65-6bcadd10f0b7",
+      "rootTaskRunId": "trn-08l4gdaq7tb142hec738lhme0",
+      "status": "failed",
+      "children": [
+        {
+          "id": "trn-08l4gdaq7tc2da7k000a7bk4g",
+          "task": "mastra-editorial-review-consistency-f36cc246e8520d33",
+          "status": "completed",
+          "attempts": 1,
+          "parent": "trn-08l4gdaq7tb142hec738lhme0"
+        },
+        {
+          "id": "trn-08l4gdaq7tc2da7k000a7bk40",
+          "task": "mastra-editorial-review-structure-a7b2cf6c7d19b737",
+          "status": "completed",
+          "attempts": 1,
+          "parent": "trn-08l4gdaq7tb142hec738lhme0"
+        },
+        {
+          "id": "trn-08l4gdaq7tc2da7k000a7bk3g",
+          "task": "mastra-editorial-review-clarity-a39fda532c78b343",
+          "status": "failed",
+          "attempts": 2,
+          "parent": "trn-08l4gdaq7tb142hec738lhme0"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "scenario": "canceled",
+      "mastraRunId": "da6b3033-fbb5-4e9b-aa86-197576d287bf",
+      "rootTaskRunId": "trn-08l4gdaq7teh7lnhs73c0ptjg",
+      "status": "canceled",
+      "children": [],
+      "passed": true
+    }
+  ],
+  "activeCancellation": {
+    "check": "cancel while waiting on children",
+    "runId": "c3980916-2713-47a7-86ec-ba14c41436c3",
+    "rootTaskRunId": "trn-08l4gdaq7tlp7lnhs73c0qnig",
+    "pausedLookupStatus": "running",
+    "status": "canceled",
+    "children": [
+      {
+        "id": "trn-08l4gdaq7tmqda7k000a7bk90",
+        "status": "canceled",
+        "parent": "trn-08l4gdaq7tlp7lnhs73c0qnig"
+      },
+      {
+        "id": "trn-08l4gdaq7tmqda7k000a7bk8g",
+        "status": "canceled",
+        "parent": "trn-08l4gdaq7tlp7lnhs73c0qnig"
+      },
+      {
+        "id": "trn-08l4gdaq7tmqda7k000a7bk80",
+        "status": "canceled",
+        "parent": "trn-08l4gdaq7tlp7lnhs73c0qnig"
+      }
+    ],
+    "passed": true
+  },
+  "backendRestart": {
+    "check": "hosted backend restart and reconnect",
+    "passed": true,
+    "runId": "f7dd6599-3926-4c1a-ba03-48b6acc2b447",
+    "rootTaskRunId": "trn-08l4gdaq7uap7lnhs73c0stdg",
+    "instancesBefore": [
+      "srv-daq7jrh7lnhs73bvkco0-n78x8"
+    ],
+    "instancesAfter": [
+      "srv-daq7jrh7lnhs73bvkco0-mzvxd"
+    ],
+    "status": "success",
+    "event": {
+      "id": "trn-08l4gdaq7uap7lnhs73c0stdg",
+      "status": "completed",
+      "received": true
+    }
+  },
+  "completionEventReplay": {
+    "subscribedAfterCompletion": true,
+    "eventReceivedWithin30Seconds": false
+  }
+}
