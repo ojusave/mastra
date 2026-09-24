@@ -1,8 +1,10 @@
 import { RequestContext } from '@mastra/core/request-context';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type { ExternalWorkItemSource } from '../../storage/domains/work-items/base.js';
 import {
   createChannelResourceIdResolver,
+  createChannelSessionResolver,
   createChannelSessionStartHook,
   resolveChannelThreadId,
   createHandlers,
@@ -384,11 +386,15 @@ describe('repo-backed thread sessions (resolveResourceId)', () => {
   // Shaped like the real `SourceControlStorageHandle` the Slack wiring now
   // consumes directly: repo resolution is the shared factory-session helper,
   // so the stub has to answer the same row lookups it makes.
-  function makeSourceControl({ existingSession = null as { sessionId: string } | null, hasRepo = true } = {}) {
+  function makeSourceControl({
+    existingSession = null as { sessionId: string } | null,
+    hasRepo = true,
+    integrationId = 'github',
+  } = {}) {
     return {
-      integrationId: 'github',
+      integrationId,
       connections: {
-        list: vi.fn().mockResolvedValue([{ id: 'conn-gh', integrationId: 'github', createdByUserId: 'owner-1' }]),
+        list: vi.fn().mockResolvedValue([{ id: `conn-${integrationId}`, integrationId, createdByUserId: 'owner-1' }]),
       },
       projectRepositories: {
         list: vi.fn().mockResolvedValue(hasRepo ? [{ id: 'pr-1', repositoryId: 'repo-1', branch: null }] : []),
@@ -444,6 +450,18 @@ describe('repo-backed thread sessions (resolveResourceId)', () => {
       baseBranch: 'main',
       visibility: 'org',
     });
+  });
+
+  it('selects the GitLab partition linked to the routed Factory project', async () => {
+    const github = makeSourceControl({ hasRepo: false });
+    const gitlab = makeSourceControl({ integrationId: 'gitlab' });
+    const { sourceControl: _legacy, ...deps } = makeResolverDeps();
+    const resolve = createChannelResourceIdResolver({ ...deps, sourceControls: [github, gitlab] } as any);
+
+    await expect(resolve(resolveArgs())).resolves.toBe('us-new');
+
+    expect(github.sessions.create).not.toHaveBeenCalled();
+    expect(gitlab.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ projectRepositoryId: 'pr-1' }));
   });
 
   it('a DM thread creates a private session; channel threads stay org-visible', async () => {
@@ -522,6 +540,56 @@ describe('repo-backed thread sessions (resolveResourceId)', () => {
 
     await expect(resolve(resolveArgs())).resolves.toBe('channel:slack:C-1:1700.42');
     expect(warn).toHaveBeenCalled();
+  });
+});
+
+describe('channel session creation context (resolveSession)', () => {
+  it('seeds Factory ownership before the controller session is created', async () => {
+    const sourceControl = {
+      sessions: {
+        getBySessionId: vi.fn().mockResolvedValue({ orgId: 'org-1', userId: 'user-1', projectRepositoryId: 'pr-1' }),
+      },
+      projectRepositories: { get: vi.fn().mockResolvedValue({ connectionId: 'conn-1' }) },
+      connections: { get: vi.fn().mockResolvedValue({ factoryProjectId: 'fp-1' }) },
+    };
+    const controller = { id: 'code', createSession: vi.fn().mockResolvedValue({ identity: 'session' }) };
+    const requestContext = new RequestContext();
+
+    const session = await createChannelSessionResolver({ sourceControl } as any)({
+      controller,
+      thread: { id: 'session-1', resourceId: 'session-1' },
+      requestContext,
+    } as any);
+
+    expect(session).toEqual({ identity: 'session' });
+    expect(controller.createSession).toHaveBeenCalledWith({
+      id: 'session-1',
+      ownerId: 'code',
+      resourceId: 'session-1',
+      requestContext,
+      tags: { factoryProjectId: 'fp-1' },
+    });
+  });
+
+  it('keeps chat-only sessions free of Factory ownership', async () => {
+    const sourceControl = {
+      sessions: { getBySessionId: vi.fn() },
+    };
+    const controller = { id: 'code', createSession: vi.fn().mockResolvedValue({}) };
+
+    await createChannelSessionResolver({ sourceControl } as any)({
+      controller,
+      thread: { id: 'thread-1', resourceId: 'channel:slack:C-1:1700.42' },
+    } as any);
+
+    expect(sourceControl.sessions.getBySessionId).not.toHaveBeenCalled();
+    expect(controller.createSession.mock.calls[0]?.[0].tags?.factoryProjectId).toBeUndefined();
+    expect(controller.createSession).toHaveBeenCalledWith({
+      id: 'channel:slack:C-1:1700.42',
+      ownerId: 'code',
+      resourceId: 'channel:slack:C-1:1700.42',
+      requestContext: undefined,
+    });
   });
 });
 
@@ -681,6 +749,8 @@ describe('Slack thread work-item creation', () => {
     expect(call.input.stages).toEqual(['execute']);
     expect(call.input.externalSource.integrationId).toBe('slack');
     expect(call.input.externalSource.type).toBe('slack-thread');
+    // Same key shape the aside lookup rebuilds, workspace included.
+    expect(call.input.externalSource.workspaceId).toBe('T-1');
     expect(call.input.externalSource.externalId).toBe('slack:C-1:1700.42');
     expect(call.input.sessions.chat.sessionId).toBe('us-42');
     expect(call.input.sessions.chat.branch).toBe('slack/1700-42');
@@ -691,6 +761,42 @@ describe('Slack thread work-item creation', () => {
     const card = thread.post.mock.calls[0][0];
     const actions = card.children.find((c: any) => c.type === 'actions');
     expect(call.input.externalSource.url).toBe(actions.children[0].url);
+  });
+
+  it('titles the card with the emoji the sender typed', async () => {
+    process.env.MASTRACODE_PUBLIC_URL = 'https://mc.example.com';
+    const deps = makeWorkItemDeps();
+    const thread = makeWorkItemThread();
+    const message = { ...makeMessage('T-1'), text: 'ship the :rocket: please' };
+
+    await createHandlers(deps as any).onDirectMessage!(thread, message, vi.fn(), handlerCtx(deps.mastra));
+
+    expect(deps.upsert.mock.calls[0][0].input.title).toBe('ship the 🚀 please');
+  });
+
+  it('cuts a long title between characters, never inside an emoji', async () => {
+    process.env.MASTRACODE_PUBLIC_URL = 'https://mc.example.com';
+    const deps = makeWorkItemDeps();
+    const thread = makeWorkItemThread();
+    const message = { ...makeMessage('T-1'), text: '😀'.repeat(100) };
+
+    await createHandlers(deps as any).onDirectMessage!(thread, message, vi.fn(), handlerCtx(deps.mastra));
+
+    const title = deps.upsert.mock.calls[0][0].input.title;
+    expect([...title]).toHaveLength(80);
+    expect(title.endsWith('😀…')).toBe(true);
+  });
+
+  it('never splits a skin-tone emoji from its base at the cut', async () => {
+    process.env.MASTRACODE_PUBLIC_URL = 'https://mc.example.com';
+    const deps = makeWorkItemDeps();
+    const thread = makeWorkItemThread();
+    const message = { ...makeMessage('T-1'), text: '👍🏼'.repeat(100) };
+
+    await createHandlers(deps as any).onDirectMessage!(thread, message, vi.fn(), handlerCtx(deps.mastra));
+
+    const title = deps.upsert.mock.calls[0][0].input.title;
+    expect(title).toBe(`${'👍🏼'.repeat(79)}…`);
   });
 
   it('a routed @-mention also creates an execute-stage work item (no per-origin split)', async () => {
@@ -793,20 +899,52 @@ describe('Slack thread work-item creation', () => {
  * message with a missing-credentials error.
  */
 describe('session start (onSessionStart)', () => {
-  function makeSession({ persistedModeModel = null as string | null, mode = 'build' } = {}) {
-    const settings = new Map<string, unknown>();
+  function makeSession({
+    persistedModeModel = null as string | null,
+    mode = 'build',
+    currentModel = 'openai/gpt-5.5',
+    // Thread settings outlive the session object that wrote them; pass the same
+    // map to a second session to stand in for a restarted process.
+    settings = new Map<string, unknown>(),
+  } = {}) {
     if (persistedModeModel) settings.set(`modeModelId_${mode}`, persistedModeModel);
     return {
       mode: { get: () => mode },
       thread: {
         getSetting: vi.fn(async ({ key }: { key: string }) => settings.get(key) ?? null),
+        setSetting: vi.fn(async ({ key, value }: { key: string; value: unknown }) => {
+          settings.set(key, value);
+        }),
       },
-      model: { switch: vi.fn(async () => {}) },
+      model: {
+        get: vi.fn(() => currentModel),
+        // Real `switch` is what makes a model choice durable: it applies the
+        // model and writes it to the thread's per-mode setting.
+        switch: vi.fn(async ({ modelId }: { modelId: string }) => {
+          settings.set(`modeModelId_${mode}`, modelId);
+        }),
+        saveForMode: vi.fn(async ({ modeId, modelId }: { modeId: string; modelId: string }) => {
+          settings.set(`modeModelId_${modeId}`, modelId);
+        }),
+      },
       om: {
-        observer: { modelId: vi.fn(() => 'initial/model'), switchModel: vi.fn(async () => {}) },
-        reflector: { modelId: vi.fn(() => 'initial/model'), switchModel: vi.fn(async () => {}) },
+        observer: makeOmRole('initial/model'),
+        reflector: makeOmRole('initial/model'),
       },
       state: { get: vi.fn(() => ({})), set: vi.fn(async () => {}) },
+      /** The model a restarted process would restore from the thread. */
+      restoredModel: () => settings.get(`modeModelId_${mode}`) ?? null,
+    };
+  }
+
+  /** Mirrors the real roles: `modelId()` reports what the last switch selected. */
+  function makeOmRole(initial: string) {
+    let current = initial;
+    return {
+      modelId: vi.fn(() => current),
+      switchModel: vi.fn(async ({ modelId }: { modelId: string }) => {
+        current = modelId;
+      }),
     };
   }
 
@@ -814,6 +952,10 @@ describe('session start (onSessionStart)', () => {
     defaultModelId = 'anthropic/claude-opus-5' as string | null,
     session = { orgId: 'org-1', userId: 'user-1', projectRepositoryId: 'pr-1' } as Record<string, string> | null,
     memoryRecord = null as Record<string, unknown> | null,
+    personalMemoryRecord = null as Record<string, unknown> | null,
+    personalMemoryLookupError = null as Error | null,
+    activePack = null as { build?: string; plan?: string; fast?: string } | null,
+    packLookupError = null as Error | null,
   } = {}) {
     return {
       projects: { getById: vi.fn(async () => ({ id: 'fp-1', defaultModelId })) } as any,
@@ -822,7 +964,22 @@ describe('session start (onSessionStart)', () => {
         projectRepositories: { get: vi.fn(async () => ({ id: 'pr-1', connectionId: 'conn-gh' })) },
         connections: { get: vi.fn(async () => ({ id: 'conn-gh', factoryProjectId: 'fp-1' })) },
       } as any,
-      memorySettings: { get: vi.fn(async () => memoryRecord) } as any,
+      memorySettings: {
+        // Two rows share this table: the project's (a `factory-project:` sentinel
+        // key) and the sender's own (their user id).
+        get: vi.fn(async ({ userId }: { userId: string }) => {
+          if (userId.startsWith('factory-project:')) return memoryRecord;
+          if (personalMemoryLookupError) throw personalMemoryLookupError;
+          return personalMemoryRecord;
+        }),
+      } as any,
+      modelPacks: {
+        getActive: vi.fn(async () => {
+          if (packLookupError) throw packLookupError;
+          if (!activePack) return null;
+          return { models: { build: '', plan: '', fast: '', ...activePack } };
+        }),
+      } as any,
     };
   }
 
@@ -843,6 +1000,86 @@ describe('session start (onSessionStart)', () => {
     // works on a thread created before this process started.
     expect(deps.sourceControl.sessions.getBySessionId).toHaveBeenCalledWith('us-1');
     expect(deps.projects.getById).toHaveBeenCalledWith({ id: 'fp-1' });
+    // No pack bought a say here, so the factory default is this thread's model
+    // from now on: the choice is on the thread, not re-derived per message.
+    expect(deps.modelPacks.getActive).toHaveBeenCalledWith({ orgId: 'org-1', userId: 'user-1' });
+    expect(session.model.switch).toHaveBeenCalledTimes(1);
+    expect(session.restoredModel()).toBe('anthropic/claude-opus-5');
+  });
+
+  // The sender's own choice outranks the factory's shared default, which is the
+  // whole point of a model pack: it is the model that user picked for themselves.
+  it("starts on the linked sender's active model pack rather than the factory default", async () => {
+    const deps = makeStartDeps({ activePack: { build: 'openai/gpt-5.6' } });
+    const session = makeSession();
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    // Keyed by the org/user pair the source-control row resolved, not by
+    // anything the Slack payload claimed.
+    expect(deps.modelPacks.getActive).toHaveBeenCalledWith({ orgId: 'org-1', userId: 'user-1' });
+    expect(session.model.switch).toHaveBeenLastCalledWith({ modelId: 'openai/gpt-5.6' });
+    expect(session.restoredModel()).toBe('openai/gpt-5.6');
+  });
+
+  // The point of persisting the choice: the thread keeps the model it started
+  // on. A later process — where the sender's pack and the factory default have
+  // both moved on — must not retarget a conversation already under way.
+  it('keeps the first model when a later start runs with a changed pack and factory default', async () => {
+    const threadSettings = new Map<string, unknown>();
+    const deps = makeStartDeps({ activePack: { build: 'openai/gpt-5.6' } });
+
+    await createChannelSessionStartHook(deps as any)(startArgs(makeSession({ settings: threadSettings })) as any);
+
+    deps.modelPacks.getActive.mockClear();
+    deps.projects.getById.mockClear();
+    deps.modelPacks.getActive.mockResolvedValue({ models: { build: 'openai/gpt-6', plan: '', fast: '' } });
+    deps.projects.getById.mockResolvedValue({ id: 'fp-1', defaultModelId: 'anthropic/claude-opus-6' });
+    const session = makeSession({ settings: threadSettings });
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    expect(session.model.switch).not.toHaveBeenCalled();
+    expect(deps.modelPacks.getActive).not.toHaveBeenCalled();
+    expect(session.restoredModel()).toBe('openai/gpt-5.6');
+  });
+
+  it("starts on the sender's pack even when the factory has no default model", async () => {
+    const deps = makeStartDeps({ defaultModelId: null, activePack: { build: 'openai/gpt-5.6' } });
+    const session = makeSession();
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    expect(session.model.switch).toHaveBeenCalledTimes(1);
+    expect(session.model.switch).toHaveBeenCalledWith({ modelId: 'openai/gpt-5.6' });
+    expect(session.restoredModel()).toBe('openai/gpt-5.6');
+  });
+
+  // A pack saved without a build model says nothing about the build phase, so
+  // the factory rung is the next answer rather than an empty model id.
+  it('falls through to the factory default when the active pack names no build model', async () => {
+    const deps = makeStartDeps({ activePack: { plan: 'openai/gpt-5.6' } });
+    const session = makeSession();
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    expect(session.model.switch).toHaveBeenCalledWith({ modelId: 'anthropic/claude-opus-5' });
+    expect(session.restoredModel()).toBe('anthropic/claude-opus-5');
+  });
+
+  // Reaching a storage domain can fail on its own (uninitialized table, a
+  // transient read error). A personal preference that cannot be read is not
+  // worth dropping the sender's message over.
+  it('falls back to the factory default when the model-pack lookup fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const deps = makeStartDeps({ packLookupError: new Error('model packs unavailable') });
+    const session = makeSession();
+
+    await expect(createChannelSessionStartHook(deps as any)(startArgs(session) as any)).resolves.toBeUndefined();
+
+    expect(session.model.switch).toHaveBeenCalledWith({ modelId: 'anthropic/claude-opus-5' });
+    expect(session.restoredModel()).toBe('anthropic/claude-opus-5');
+    expect(warn).toHaveBeenCalled();
   });
 
   it('applies the owner observational-memory settings, matching the web kickoff', async () => {
@@ -851,22 +1088,181 @@ describe('session start (onSessionStart)', () => {
 
     await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
 
-    expect(deps.memorySettings.get).toHaveBeenCalledWith({ orgId: 'org-1', userId: 'user-1' });
+    expect(deps.memorySettings.get).toHaveBeenCalledWith({ orgId: 'org-1', userId: 'factory-project:fp-1' });
     expect(session.om.observer.switchModel).toHaveBeenCalledWith({ modelId: 'openai/gpt-5.4-mini' });
     expect(session.state.set).toHaveBeenCalledWith(expect.objectContaining({ observationThreshold: 111 }));
+    // The sender's own row is read too, and an absent one simply leaves the
+    // project's configuration in place.
+    expect(deps.memorySettings.get).toHaveBeenCalledWith({ orgId: 'org-1', userId: 'user-1' });
+  });
+
+  // Observational memory is the sender's to configure: a thread they are talking
+  // to should observe the way their own settings say, not the way the project's
+  // shared row does.
+  it("applies the linked sender's own memory settings over the project's", async () => {
+    const deps = makeStartDeps({
+      memoryRecord: { observerModelId: 'anthropic/claude-haiku-4-5', observationThreshold: 111 },
+      personalMemoryRecord: { observerModelId: 'openai/gpt-5.4-mini', observationThreshold: 222 },
+    });
+    const session = makeSession();
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    // Applied last, so the sender's row is what the session ends up running.
+    expect(session.om.observer.switchModel).toHaveBeenLastCalledWith({ modelId: 'openai/gpt-5.4-mini' });
+    expect(session.om.observer.modelId()).toBe('openai/gpt-5.4-mini');
+    expect(session.state.set).toHaveBeenLastCalledWith(expect.objectContaining({ observationThreshold: 222 }));
+  });
+
+  // The row is authoritative only for what the sender saved. A knob they never
+  // touched must keep the project's value rather than snapping back to the
+  // built-in default — the factory's provider may be the only credentialed one.
+  it("keeps the project's memory settings for the knobs the sender never saved", async () => {
+    const deps = makeStartDeps({
+      memoryRecord: { observerModelId: 'anthropic/claude-haiku-4-5', observationThreshold: 111 },
+      personalMemoryRecord: { observerModelId: null, observationThreshold: 222 },
+    });
+    const session = makeSession();
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    expect(session.om.observer.modelId()).toBe('anthropic/claude-haiku-4-5');
+    expect(session.state.set).toHaveBeenLastCalledWith(expect.objectContaining({ observationThreshold: 222 }));
+  });
+
+  // Memory settings are stored preference, not a choice made on this thread: a
+  // restarted process re-resolves the project's row at session creation, so the
+  // sender's row has to be re-applied even where the model is already decided.
+  it('re-applies the sender memory settings on a restarted session whose model is persisted', async () => {
+    const deps = makeStartDeps({
+      personalMemoryRecord: { observerModelId: 'openai/gpt-5.4-mini', reflectionThreshold: 333 },
+    });
+    const session = makeSession({ persistedModeModel: 'anthropic/claude-fable-5' });
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    expect(session.om.observer.switchModel).toHaveBeenCalledWith({ modelId: 'openai/gpt-5.4-mini' });
+    expect(session.state.set).toHaveBeenCalledWith(expect.objectContaining({ reflectionThreshold: 333 }));
+    // Still no model re-resolution: the two halves of the hook are independent.
+    expect(deps.modelPacks.getActive).not.toHaveBeenCalled();
+    expect(deps.projects.getById).not.toHaveBeenCalled();
+    expect(session.model.switch).not.toHaveBeenCalled();
+    expect(session.restoredModel()).toBe('anthropic/claude-fable-5');
+  });
+
+  // Reaching a storage domain can fail on its own (uninitialized table, a
+  // transient read error). The sender's settings are a preference, not a
+  // prerequisite for answering their message.
+  it("falls back to the project's memory settings when the sender's row cannot be read", async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const deps = makeStartDeps({
+      memoryRecord: { observerModelId: 'anthropic/claude-haiku-4-5', observationThreshold: 111 },
+      personalMemoryLookupError: new Error('memory settings unavailable'),
+    });
+    const session = makeSession();
+
+    await expect(createChannelSessionStartHook(deps as any)(startArgs(session) as any)).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalled();
+    expect(session.om.observer.modelId()).toBe('anthropic/claude-haiku-4-5');
+    expect(session.state.set).toHaveBeenCalledWith(expect.objectContaining({ observationThreshold: 111 }));
+    expect(session.model.switch).toHaveBeenCalledWith({ modelId: 'anthropic/claude-opus-5' });
   });
 
   // The durable record of a deliberate choice: either an earlier start or the
-  // user's own switch. Re-applying the factory default over it would undo the
-  // user's selection every time the process restarts.
-  it('leaves a session alone when its mode already has a model persisted on the thread', async () => {
-    const deps = makeStartDeps();
+  // user's own switch. Re-applying a preference over it would undo the user's
+  // selection every time the process restarts or another message arrives.
+  it('leaves the model alone when its mode already has a model persisted on the thread', async () => {
+    const deps = makeStartDeps({ activePack: { build: 'openai/gpt-5.6' } });
     const session = makeSession({ persistedModeModel: 'anthropic/claude-fable-5' });
 
     await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
 
     expect(session.model.switch).not.toHaveBeenCalled();
+    expect(session.model.saveForMode).not.toHaveBeenCalled();
+    // Nothing is re-resolved: the thread's model was decided when it started,
+    // and a pack the user has since changed must not retarget it.
+    expect(deps.modelPacks.getActive).not.toHaveBeenCalled();
+    expect(deps.projects.getById).not.toHaveBeenCalled();
+    expect(session.restoredModel()).toBe('anthropic/claude-fable-5');
+    // The factory stamp still lands: org-first credential resolution keys off
+    // controller state even when the model choice is already persisted.
+    expect(session.state.set).toHaveBeenCalledWith({ factoryProjectId: 'fp-1' });
+    expect(session.state.set).toHaveBeenCalledWith(expect.objectContaining({ factoryOrgId: 'org-1' }));
+  });
+
+  // An ungated dispatch marks the session unresolved above every guard. Owner
+  // recovery is the resolution, so it has to take the marker down with it —
+  // otherwise curation stays disabled for the life of the session over a stale flag.
+  it('clears the unresolved marker when owner recovery resolves the organization', async () => {
+    const deps = makeStartDeps();
+    const session = makeSession();
+    session.state.get = vi.fn(() => ({ factoryOrgUnresolved: true })) as any;
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    expect(session.state.set).toHaveBeenCalledWith({ factoryOrgId: 'org-1', factoryOrgUnresolved: false });
+  });
+
+  // The org rung knowledge curation scopes on. `gateDispatch` stamps it on the
+  // request context before the session exists, so it is in hand above every
+  // guard below — and seeding it must not cost a storage read.
+  const orgContext = (organizationId: unknown) => ({
+    get: (key: string) => (key === 'user' ? { id: 'user-1', organizationId } : undefined),
+  });
+
+  it('seeds the organization on a chat-only thread, which reaches no other seam', async () => {
+    const deps = makeStartDeps();
+    const session = makeSession();
+
+    await createChannelSessionStartHook(deps as any)({
+      ...startArgs(session, 'channel:slack:C-1:1700.42'),
+      requestContext: orgContext('org-1'),
+    } as any);
+
+    expect(session.state.set).toHaveBeenCalledWith({ factoryOrgId: 'org-1' });
     expect(deps.sourceControl.sessions.getBySessionId).not.toHaveBeenCalled();
+  });
+
+  it('still seeds the organization when a mode model is already persisted', async () => {
+    const deps = makeStartDeps();
+    const session = makeSession({ persistedModeModel: 'anthropic/claude-fable-5' });
+
+    await createChannelSessionStartHook(deps as any)({
+      ...startArgs(session),
+      requestContext: orgContext('org-1'),
+    } as any);
+
+    expect(session.state.set).toHaveBeenCalledWith({ factoryOrgId: 'org-1' });
+    // The guard still holds: the persisted mode model is left alone.
+    expect(session.model.switch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no request context at all', undefined],
+    ['a context whose user carries no org', orgContext(null)],
+  ])('marks the session unresolved given %s', async (_label, requestContext) => {
+    const deps = makeStartDeps();
+    const session = makeSession();
+
+    await createChannelSessionStartHook(deps as any)({
+      ...startArgs(session, 'channel:slack:C-1:1700.42'),
+      requestContext,
+    } as any);
+
+    expect(session.state.set).toHaveBeenCalledWith({ factoryOrgUnresolved: true });
+    expect(session.state.set).not.toHaveBeenCalledWith(expect.objectContaining({ factoryOrgId: expect.anything() }));
+  });
+
+  it('marks the session unresolved when the channel dependencies are absent', async () => {
+    const session = makeSession();
+
+    await createChannelSessionStartHook({} as any)({
+      ...startArgs(session),
+      requestContext: undefined,
+    } as any);
+
+    expect(session.state.set).toHaveBeenCalledWith({ factoryOrgUnresolved: true });
   });
 
   it('skips chat-only threads, whose resourceId names no project', async () => {
@@ -877,6 +1273,8 @@ describe('session start (onSessionStart)', () => {
 
     expect(session.model.switch).not.toHaveBeenCalled();
     expect(deps.sourceControl.sessions.getBySessionId).not.toHaveBeenCalled();
+    // Chat-only threads have no linked sender to read a pack for either.
+    expect(deps.modelPacks.getActive).not.toHaveBeenCalled();
   });
 
   it('configures nothing when the session row is gone', async () => {
@@ -886,14 +1284,159 @@ describe('session start (onSessionStart)', () => {
     await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
 
     expect(session.model.switch).not.toHaveBeenCalled();
+    expect(deps.modelPacks.getActive).not.toHaveBeenCalled();
   });
 
-  it('leaves the session on its default when the factory has no default model', async () => {
+  // Nothing chose a model here, so the SDK's built-in mode default is the
+  // thread's answer — recorded as such, because a future SDK that moves that
+  // default must not silently retarget a conversation already under way.
+  it('records the SDK mode default when neither a pack nor a factory default exists', async () => {
     const deps = makeStartDeps({ defaultModelId: null });
-    const session = makeSession();
+    const session = makeSession({ currentModel: 'openai/gpt-5.5' });
 
     await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
 
     expect(session.model.switch).not.toHaveBeenCalled();
+    expect(session.model.saveForMode).toHaveBeenCalledWith({ modeId: 'build', modelId: 'openai/gpt-5.5' });
+    expect(session.restoredModel()).toBe('openai/gpt-5.5');
+  });
+
+  it('records nothing when the session has no model to record', async () => {
+    const deps = makeStartDeps({ defaultModelId: null });
+    const session = makeSession({ currentModel: '' });
+
+    await createChannelSessionStartHook(deps as any)(startArgs(session) as any);
+
+    expect(session.model.saveForMode).not.toHaveBeenCalled();
+    expect(session.restoredModel()).toBe(null);
+  });
+});
+
+describe('Slack aside ingest', () => {
+  function makeAside(text = 'aside: looks good to me') {
+    return {
+      id: '1700.99',
+      author: { userId: 'U-sender', userName: 'caleb', fullName: 'Caleb Stone', isBot: false },
+      text,
+      metadata: { dateSent: new Date('2026-08-30T10:00:00.000Z'), edited: false },
+      raw: { team_id: 'T-1' },
+    } as any;
+  }
+
+  function makeAsideDeps({ link = { orgId: 'org-1', userId: 'user-1' } as { orgId?: string; userId: string } | null } = {}) {
+    const thread = makeThread();
+    thread.id = 'slack:C-1:1700.42';
+    thread.post = vi.fn();
+    return {
+      thread,
+      deps: {
+        accountLinks: {
+          getAccountLink: vi.fn().mockResolvedValue(link),
+          setDefaultFactory: vi.fn().mockResolvedValue(true),
+        } as any,
+        projects: makeProjects([{ id: 'fp-1', slackWorkItemsEnabled: true }]) as any,
+        workItems: {
+          getBySource: vi.fn().mockResolvedValue({ id: 'wi-1', orgId: 'org-1', factoryProjectId: 'fp-1' }),
+        } as any,
+        feed: { createComment: vi.fn().mockResolvedValue({ status: 'created' }) },
+      },
+    };
+  }
+
+  it('lands a linked sender aside on the card the thread created, attributed to their tenant user', async () => {
+    const { thread, deps } = makeAsideDeps();
+    const defaultHandler = vi.fn();
+
+    await createHandlers(deps as any).onSubscribedMessage!(thread, makeAside(), defaultHandler, handlerCtx());
+
+    // Never dispatched: an aside is human talk the agent must not answer.
+    expect(defaultHandler).not.toHaveBeenCalled();
+    // Scoped by the sending workspace: a channel id and a `ts` only identify a
+    // thread inside the team that issued them.
+    expect(deps.workItems.getBySource).toHaveBeenCalledWith({
+      integrationId: 'slack',
+      type: 'slack-thread',
+      workspaceId: 'T-1',
+      externalId: 'slack:C-1:1700.42',
+    });
+    expect(deps.feed.createComment).toHaveBeenCalledTimes(1);
+    expect(deps.feed.createComment.mock.calls[0][0]).toMatchObject({
+      orgId: 'org-1',
+      workItemId: 'wi-1',
+      // The leading `aside` marker is Slack routing, not part of what was said.
+      body: 'looks good to me',
+      author: { kind: 'user', id: 'user-1', displayName: 'Caleb Stone' },
+      occurredAt: new Date('2026-08-30T10:00:00.000Z'),
+      externalSource: { integrationId: 'slack', type: 'message', workspaceId: 'T-1', externalId: 'C-1:1700.99' },
+    });
+
+    // The next real message still belongs to the agent alone: it already shows
+    // in the bound transcript, so a comment would say the same thing twice.
+    await createHandlers(deps as any).onSubscribedMessage!(thread, makeAside('ship it'), defaultHandler, handlerCtx());
+    expect(defaultHandler).toHaveBeenCalledTimes(1);
+    expect(deps.feed.createComment).toHaveBeenCalledTimes(1);
+  });
+
+  it('lands the emoji the sender typed, and leaves a custom workspace emoji as written', async () => {
+    const { thread, deps } = makeAsideDeps();
+
+    await createHandlers(deps as any).onSubscribedMessage!(
+      thread,
+      makeAside('aside: nice :thumbsup::skin-tone-3: — ship it :party-parrot:'),
+      vi.fn(),
+      handlerCtx(),
+    );
+
+    expect(deps.feed.createComment.mock.calls[0][0].body).toBe('nice 👍🏼 — ship it :party-parrot:');
+  });
+
+  it('stores an unlinked sender aside under their Slack identity, silently (no Connect card)', async () => {
+    process.env.MASTRACODE_PUBLIC_URL = 'https://mc.example.com';
+    const { thread, deps } = makeAsideDeps({ link: null });
+
+    await createHandlers(deps as any).onSubscribedMessage!(thread, makeAside(), vi.fn(), handlerCtx());
+
+    expect(thread.postEphemeral).not.toHaveBeenCalled();
+    expect(deps.feed.createComment.mock.calls[0][0].author).toMatchObject({
+      kind: 'user',
+      id: 'slack:U-sender',
+      displayName: 'Caleb Stone',
+    });
+  });
+
+  it('still lands an aside on a card keyed before the workspace joined the key', async () => {
+    const { thread, deps } = makeAsideDeps();
+    deps.workItems.getBySource = vi.fn(async (source: ExternalWorkItemSource) =>
+      source.workspaceId ? null : { id: 'wi-legacy', orgId: 'org-1', factoryProjectId: 'fp-1' },
+    );
+
+    await createHandlers(deps as any).onSubscribedMessage!(thread, makeAside(), vi.fn(), handlerCtx());
+
+    expect(deps.feed.createComment.mock.calls[0][0].workItemId).toBe('wi-legacy');
+  });
+
+  it('ingests nothing when the thread has no card', async () => {
+    const { thread, deps } = makeAsideDeps();
+    deps.workItems.getBySource = vi.fn().mockResolvedValue(null);
+    const defaultHandler = vi.fn();
+
+    await createHandlers(deps as any).onSubscribedMessage!(thread, makeAside(), defaultHandler, handlerCtx());
+
+    // Scoped key, then the pre-workspace one.
+    expect(deps.workItems.getBySource).toHaveBeenCalledTimes(2);
+    expect(deps.feed.createComment).not.toHaveBeenCalled();
+    expect(defaultHandler).not.toHaveBeenCalled();
+  });
+
+  it('never lets an ingest failure reach the Slack thread', async () => {
+    const { thread, deps } = makeAsideDeps();
+    deps.feed.createComment = vi.fn().mockRejectedValue(new Error('storage down'));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(
+      createHandlers(deps as any).onSubscribedMessage!(thread, makeAside(), vi.fn(), handlerCtx()),
+    ).resolves.toBeUndefined();
+    expect(deps.feed.createComment).toHaveBeenCalledTimes(1);
+    expect(thread.post).not.toHaveBeenCalled();
   });
 });

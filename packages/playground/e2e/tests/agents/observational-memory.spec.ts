@@ -18,7 +18,20 @@ import { selectFixture } from '../__utils__/select-fixture';
  */
 
 async function openMemorySidebar(page: Page) {
+  // On /new with no threads the left panel starts collapsed; expand it to reach the memory card.
+  // The collapse animates, so the card can be briefly visible alongside the expand button: give the
+  // panel a moment to settle before deciding whether it needs expanding.
+  const expandPanel = page.getByRole('button', { name: 'Expand panel' });
   const memoryCard = page.getByTestId('memory-sidebar-card');
+  await expect(expandPanel.or(memoryCard).filter({ visible: true }).first()).toBeVisible({ timeout: 10000 });
+  const isCollapsed = await expandPanel.waitFor({ state: 'visible', timeout: 1500 }).then(
+    () => true,
+    () => false,
+  );
+  if (isCollapsed) {
+    await expandPanel.click();
+    await expect(expandPanel).toBeHidden();
+  }
   await expect(memoryCard).toBeVisible({ timeout: 10000 });
 
   if ((await memoryCard.getAttribute('aria-pressed')) !== 'true') {
@@ -44,7 +57,7 @@ test.describe('Observational Memory - Behavior Tests', () => {
       await page.goto('/agents/om-agent/chat/new');
 
       // Wait for the page to load and OM to initialize
-      await expect(page.locator('h2')).toContainText('OM Agent');
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
 
       // Open the live Memory sidebar to see OM status.
       await openMemorySidebar(page);
@@ -69,7 +82,7 @@ test.describe('Observational Memory - Behavior Tests', () => {
       await page.goto('/agents/om-agent/chat/new');
 
       // Wait for page to load
-      await expect(page.locator('h2')).toContainText('OM Agent');
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
 
       // Open the live Memory sidebar to see OM status.
       await openMemorySidebar(page);
@@ -107,7 +120,7 @@ test.describe('Observational Memory - Behavior Tests', () => {
       await page.goto('/agents/om-agent/chat/new');
 
       // Wait for page to load
-      await expect(page.locator('h2')).toContainText('OM Agent');
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
 
       // ACT: Send a message to trigger the agent
       const chatInput = page.locator('textarea[placeholder*="message"]').first();
@@ -211,7 +224,7 @@ test.describe('Observational Memory - Behavior Tests', () => {
       await page.goto('/agents/om-agent/chat/new');
 
       // Wait for page to load
-      await expect(page.locator('h2')).toContainText('OM Agent');
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
 
       const chatInput = page.locator('textarea[placeholder*="message"]').first();
       const threadWrapper = page.locator('[data-testid="thread-wrapper"]');
@@ -238,7 +251,9 @@ test.describe('Observational Memory - Behavior Tests', () => {
       await page.reload();
 
       // Wait for page to reload
-      await expect(page.locator('h2')).toContainText('OM Agent', { timeout: 10000 });
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true', {
+        timeout: 10000,
+      });
 
       const urlAfterReload = page.url();
       console.log('URL after reload:', urlAfterReload);
@@ -271,7 +286,7 @@ test.describe('Observational Memory - Behavior Tests', () => {
       await page.goto('/agents/om-agent/chat/new');
 
       // Wait for page to load
-      await expect(page.locator('h2')).toContainText('OM Agent');
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
 
       const chatInput = page.locator('textarea[placeholder*="message"]').first();
       const threadWrapper = page.locator('[data-testid="thread-wrapper"]');
@@ -309,7 +324,7 @@ test.describe('Observational Memory - Behavior Tests', () => {
       await page.goto('/agents/om-adaptive-agent/chat/new');
 
       // Wait for page to load
-      await expect(page.locator('h2')).toContainText('OM Adaptive Agent');
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
 
       // Open the live Memory sidebar to see OM status.
       await openMemorySidebar(page);
@@ -398,7 +413,9 @@ test.describe('Observational Memory - Edge Cases', () => {
       await page.goto('/agents/om-agent/chat/new');
 
       // ASSERT: Page should load without stuck loading states
-      await expect(page.locator('h2')).toContainText('OM Agent', { timeout: 10000 });
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true', {
+        timeout: 10000,
+      });
 
       // Open the live Memory sidebar to see OM status.
       await openMemorySidebar(page);
@@ -420,7 +437,7 @@ test.describe('Observational Memory - Edge Cases', () => {
 
       // Create first thread
       await page.goto('/agents/om-agent/chat/new');
-      await expect(page.locator('h2')).toContainText('OM Agent');
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
 
       const chatInput = page.locator('textarea[placeholder*="message"]').first();
       await chatInput.fill('Message in thread 1');
@@ -432,7 +449,7 @@ test.describe('Observational Memory - Edge Cases', () => {
 
       // ACT: Create second thread
       await page.goto('/agents/om-agent/chat/new');
-      await expect(page.locator('h2')).toContainText('OM Agent');
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
 
       // Open the live Memory sidebar to see OM status.
       await openMemorySidebar(page);
@@ -446,7 +463,9 @@ test.describe('Observational Memory - Edge Cases', () => {
       await page.goto(thread1Url);
 
       // First thread should still have its state
-      await expect(page.locator('h2')).toContainText('OM Agent', { timeout: 10000 });
+      await expect(page.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true', {
+        timeout: 10000,
+      });
     });
   });
 });

@@ -12,6 +12,7 @@ import { safeStringify } from '@mastra/core/utils';
 import { parse as parseJsonRiver } from 'jsonriver';
 
 import { ensureAssistantRenderSegment } from '../assistant-render-registry.js';
+import { getBackgroundToolMetadata } from '../background-tool-result.js';
 import { reconcileChatBoundarySpacers } from '../chat-boundary-reconciliation.js';
 import { AskQuestionInlineComponent } from '../components/ask-question-inline.js';
 import { AssistantMessageComponent } from '../components/assistant-message.js';
@@ -282,7 +283,6 @@ function insertTaskToolErrorComponent(ctx: EventHandlerContext, component: unkno
     const insertIndex = state.chatContainer.children.indexOf(state.streamingComponent as never);
     if (insertIndex >= 0) {
       (state.chatContainer.children as unknown[]).splice(insertIndex, 0, component);
-      state.chatContainer.invalidate();
       return;
     }
   }
@@ -586,6 +586,9 @@ export function handleToolInputStart(ctx: EventHandlerContext, toolCallId: strin
     createPostToolAssistantComponent(ctx, toolCallId);
 
     flushRender(state);
+  } else if (toolName === 'subagent') {
+    createPostToolAssistantComponent(ctx, toolCallId);
+    flushRender(state);
   } else if (isTaskMutationTool(toolName)) {
     // Record position so task_updated can place inline completed/cleared display here
     state.taskToolInsertIndex = state.chatContainer.children.length;
@@ -756,18 +759,30 @@ export function handleToolInputEnd(ctx: EventHandlerContext, toolCallId: string)
   closeToolInputParser(toolCallId);
 }
 
-export function handleToolEnd(ctx: EventHandlerContext, toolCallId: string, result: unknown, isError: boolean): void {
+export function handleToolEnd(
+  ctx: EventHandlerContext,
+  toolCallId: string,
+  result: unknown,
+  isError: boolean,
+  providerMetadata?: unknown,
+): void {
   flushPendingShellOutput(ctx, toolCallId);
   const { state } = ctx;
+  const background = state.options?.backgroundToolsEnabled ? getBackgroundToolMetadata(providerMetadata) : undefined;
   // If this is a subagent tool, store the result in the SubagentExecutionComponent
   const subagentComponent = state.pendingSubagents.get(toolCallId);
   if (subagentComponent) {
     const resultText = formatToolResult(result);
     if (pluginSubagentToolCallIds.has(toolCallId)) {
-      subagentComponent.finish(isError, 0, resultText);
-      state.pendingSubagents.delete(toolCallId);
-      pluginSubagentToolCallIds.delete(toolCallId);
-      flushRender(state);
+      if (background) subagentComponent.setBackgroundTaskId(background.taskId);
+      if (background?.status === 'running' && !isError) {
+        flushRender(state);
+      } else {
+        subagentComponent.finish(isError, 0, resultText);
+        state.pendingSubagents.delete(toolCallId);
+        pluginSubagentToolCallIds.delete(toolCallId);
+        flushRender(state);
+      }
     } else {
       // We'll need to wait for subagent_end to set this
       // Store it temporarily
@@ -794,15 +809,20 @@ export function handleToolEnd(ctx: EventHandlerContext, toolCallId: string, resu
       state.allToolComponents.push(component);
     }
 
+    const resultText = formatToolResult(result);
+    const isBackgroundPlaceholder = background?.status === 'running' && !effectiveIsError;
+    if (background) component.setBackgroundTaskId?.(background.taskId);
     const toolResult: ToolResult = {
-      content: [{ type: 'text', text: formatToolResult(result) }],
+      content: [{ type: 'text', text: resultText }],
       isError: effectiveIsError,
     };
-    component.updateResult(toolResult, false);
+    component.updateResult(toolResult, isBackgroundPlaceholder);
     reconcileToolBoundaries(ctx);
 
-    state.pendingTools.delete(toolCallId);
-    state.pendingTaskToolIds?.delete(toolCallId);
+    if (!isBackgroundPlaceholder) {
+      state.pendingTools.delete(toolCallId);
+      state.pendingTaskToolIds?.delete(toolCallId);
+    }
     flushRender(state);
   }
 }

@@ -74,6 +74,11 @@ createWorkflowTestSuite({
   },
 
   beforeEach: async () => {
+    // These workflows share a single storage instance and rely on real, unique run
+    // IDs so a previous test's snapshot can never be mistaken for the current run.
+    // The shared test setup installs a deterministic `globalThis.crypto.randomUUID`
+    // spy before every test, so undo it for this suite.
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockRestore();
     vi.clearAllMocks();
   },
 
@@ -623,6 +628,53 @@ describe('Workflow (Default Engine Specifics)', () => {
       expect(stepResult?.nonRetryable).toBe(true);
     });
 
+    it('does not retry nested workflows with non-retryable step failures', async () => {
+      let calls = 0;
+
+      const fatalStep = createStep({
+        id: 'nested-fatal-step',
+        execute: async () => {
+          calls++;
+          throw new MastraNonRetryableError('permanent failure');
+        },
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      const nestedWorkflow = createWorkflow({
+        id: 'nested-fatal-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        steps: [fatalStep],
+      });
+      nestedWorkflow.then(fatalStep).commit();
+
+      const workflow = createWorkflow({
+        id: 'non-retryable-parent-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        retryConfig: { attempts: 3, delay: 0 },
+        steps: [nestedWorkflow],
+      });
+      workflow.then(nestedWorkflow).commit();
+
+      new Mastra({
+        logger: false,
+        storage: testStorage,
+        workflows: { 'non-retryable-parent-workflow': workflow },
+      });
+
+      const run = await workflow.createRun();
+      const result = await run.start({ inputData: {} });
+
+      expect(result.status).toBe('failed');
+      expect(calls).toBe(1);
+
+      const stepResult = result.steps['nested-fatal-workflow'];
+      expect(stepResult?.status).toBe('failed');
+      expect(stepResult?.nonRetryable).toBe(true);
+    });
+
     it('retries workflow steps that throw transient errors until attempts are exhausted', async () => {
       let calls = 0;
 
@@ -658,6 +710,53 @@ describe('Workflow (Default Engine Specifics)', () => {
       expect(calls).toBe(4);
 
       const stepResult = result.steps['transient-step'];
+      expect(stepResult?.status).toBe('failed');
+      expect(stepResult?.nonRetryable).toBeUndefined();
+    });
+
+    it('retries nested workflows with transient step failures', async () => {
+      let calls = 0;
+
+      const transientStep = createStep({
+        id: 'nested-transient-step',
+        execute: async () => {
+          calls++;
+          throw new Error('transient failure');
+        },
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      const nestedWorkflow = createWorkflow({
+        id: 'nested-transient-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        steps: [transientStep],
+      });
+      nestedWorkflow.then(transientStep).commit();
+
+      const workflow = createWorkflow({
+        id: 'retryable-parent-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        retryConfig: { attempts: 3, delay: 0 },
+        steps: [nestedWorkflow],
+      });
+      workflow.then(nestedWorkflow).commit();
+
+      new Mastra({
+        logger: false,
+        storage: testStorage,
+        workflows: { 'retryable-parent-workflow': workflow },
+      });
+
+      const run = await workflow.createRun();
+      const result = await run.start({ inputData: {} });
+
+      expect(result.status).toBe('failed');
+      expect(calls).toBe(4);
+
+      const stepResult = result.steps['nested-transient-workflow'];
       expect(stepResult?.status).toBe('failed');
       expect(stepResult?.nonRetryable).toBeUndefined();
     });

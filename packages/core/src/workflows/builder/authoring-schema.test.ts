@@ -3,12 +3,14 @@ import {
   normalizeWorkflowBuilderDefinition,
   WORKFLOW_BUILDER_MAPPING_CONFIG_DESCRIPTION,
   workflowBuilderAgentEntrySchema,
+  workflowBuilderClassifierEntrySchema,
   workflowBuilderConditionalEntrySchema,
   workflowBuilderDefinitionInputSchema,
   workflowBuilderDefinitionSchema,
   workflowBuilderForeachEntrySchema,
   workflowBuilderNestedWorkflowEntrySchema,
   workflowBuilderParallelEntrySchema,
+  workflowBuilderScheduleConfigSchema,
   storedWorkflowDefinitionSchema,
 } from './index';
 
@@ -48,6 +50,8 @@ describe('shared workflow builder authoring schema', () => {
     expect(workflowBuilderAgentEntrySchema.description).toContain(
       'Default agents consume { prompt: string } and return { text: string }',
     );
+    expect(workflowBuilderClassifierEntrySchema.description).toContain('{ answers, usage }');
+    expect(workflowBuilderClassifierEntrySchema.description).toContain('following conditional entry');
     // The call-site id addresses the nested workflow's result; it is independent
     // of the referenced workflowId (registry keys and intrinsic ids can differ).
     expect(workflowBuilderNestedWorkflowEntrySchema.description).toContain('stepResults.<id>');
@@ -83,6 +87,47 @@ describe('shared workflow builder authoring schema', () => {
     it('accepts object-form mapping configs before normalization', () => {
       expect(() => workflowBuilderDefinitionInputSchema.parse(authoringDefinition)).not.toThrow();
     });
+
+    it('accepts classifier entries and their serializable options', () => {
+      const definition = {
+        ...authoringDefinition,
+        graph: [
+          {
+            type: 'classifier',
+            id: 'classify-ticket',
+            classifierId: 'ticket-router',
+            options: { maxRetries: 1, retries: 2, metadata: { owner: 'support' } },
+          },
+        ],
+      };
+
+      expect(workflowBuilderDefinitionInputSchema.parse(definition).graph[0]).toEqual(definition.graph[0]);
+      expect(workflowBuilderDefinitionSchema.parse(normalizeWorkflowBuilderDefinition(definition)).graph[0]).toEqual(
+        definition.graph[0],
+      );
+    });
+
+    it('rejects malformed classifier entries', () => {
+      expect(
+        workflowBuilderDefinitionInputSchema.safeParse({
+          ...authoringDefinition,
+          graph: [{ type: 'classifier', id: 'classify-ticket', classifierId: '' }],
+        }).success,
+      ).toBe(false);
+    });
+
+    it.each([{ providerOptions: { temperature: Infinity } }, { metadata: { transform: () => 'invalid' } }])(
+      'rejects non-JSON classifier options in both schema dialects',
+      options => {
+        const definition = {
+          ...authoringDefinition,
+          graph: [{ type: 'classifier', id: 'classify-ticket', classifierId: 'ticket-router', options }],
+        };
+
+        expect(workflowBuilderDefinitionInputSchema.safeParse(definition).success).toBe(false);
+        expect(workflowBuilderDefinitionSchema.safeParse(definition).success).toBe(false);
+      },
+    );
 
     it('accepts the normalized form of the same definition through the strict schema', () => {
       const normalized = normalizeWorkflowBuilderDefinition(authoringDefinition);
@@ -249,13 +294,28 @@ describe('shared workflow builder authoring schema', () => {
     it.each([
       ['an invented foreach input selector', { type: 'foreach', input: { step: 'lookup', path: 'customers' } }],
       ['an invented foreach items selector', { type: 'foreach', items: { initData: true, path: 'customers' } }],
-      ['a container id', { type: 'foreach', id: 'lookup-each' }],
     ])('rejects %s', (_label, extra) => {
       const result = workflowBuilderDefinitionInputSchema.safeParse({
         ...authoringDefinition,
         graph: [{ step: { type: 'tool', id: 'lookup', toolId: 'lookupCustomer' }, ...extra }],
       });
       expect(result.success).toBe(false);
+    });
+
+    it('accepts the identity/display fields (id, description, metadata) on a container entry', () => {
+      const result = workflowBuilderDefinitionInputSchema.safeParse({
+        ...authoringDefinition,
+        graph: [
+          {
+            type: 'foreach',
+            id: 'lookup-each',
+            description: 'Look up every customer',
+            metadata: { title: 'Lookup each' },
+            step: { type: 'tool', id: 'lookup', toolId: 'lookupCustomer' },
+          },
+        ],
+      });
+      expect(result.success).toBe(true);
     });
 
     it('rejects a bogus inputMapping descriptor on a container child', () => {
@@ -274,6 +334,29 @@ describe('shared workflow builder authoring schema', () => {
         ],
       });
       expect(result.success).toBe(false);
+    });
+  });
+
+  describe('schedule configuration', () => {
+    it('accepts valid cron, timezone, and nested JSON values', () => {
+      expect(
+        workflowBuilderScheduleConfigSchema.safeParse({
+          cron: '0 9 * * 1',
+          timezone: 'America/New_York',
+          inputData: { nested: [null, true, 42, 'value'] },
+          requestContext: { tenant: { id: 'acme' } },
+        }).success,
+      ).toBe(true);
+    });
+
+    it.each([
+      { cron: 'not a cron' },
+      { cron: '0 9 * * 1', timezone: 'Not/A_Timezone' },
+      { cron: '0 9 * * 1', inputData: { invalid: undefined } },
+      { cron: '0 9 * * 1', initialState: new Date() },
+      { cron: '0 9 * * 1', metadata: { invalid: Number.POSITIVE_INFINITY } },
+    ])('rejects invalid schedule config %#', schedule => {
+      expect(workflowBuilderScheduleConfigSchema.safeParse(schedule).success).toBe(false);
     });
   });
 

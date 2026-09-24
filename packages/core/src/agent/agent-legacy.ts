@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { WritableStream } from 'node:stream/web';
 import type { CoreMessage, UIMessage, Tool } from '@internal/ai-sdk-v4';
 import deepEqual from 'fast-deep-equal';
@@ -19,7 +18,9 @@ import type {
 import type { ProviderOptions } from '../llm/model/provider-options';
 import type { MastraModelConfig, TripwireProperties } from '../llm/model/shared.types';
 import type { Mastra } from '../mastra';
+import { createRunScope, createRunScopeKey } from '../mastra/run-scope';
 import type { MastraMemory } from '../memory/memory';
+import { getMemoryRunState, MemoryRunState } from '../memory/run-state';
 import type { MemoryConfigInternal, StorageThreadType } from '../memory/types';
 import type { Span, TracingOptions, TracingProperties, ObservabilityContext } from '../observability';
 import {
@@ -49,7 +50,12 @@ import type {
 } from './types';
 
 import { resolveThreadIdFromArgs } from './utils';
-import { fireClientToolOutputHooks } from './workflows/prepare-stream/client-tool-output-hooks';
+import {
+  applyClientToolModelOutput,
+  fireClientToolOutputHooks,
+} from './workflows/prepare-stream/client-tool-output-hooks';
+
+const LEGACY_MEMORY_RUN_STATE_KEY = createRunScopeKey<MemoryRunState>('agent-legacy.memoryRunState');
 
 /**
  * Interface for accessing Agent methods needed by the legacy handler.
@@ -250,6 +256,7 @@ export class AgentLegacyHandler {
     inputProcessors,
     providerOptions,
     hooks,
+    runScope,
     ...rest
   }: {
     instructions: AgentInstructions;
@@ -268,6 +275,7 @@ export class AgentLegacyHandler {
     inputProcessors?: InputProcessorOrWorkflow[];
     providerOptions?: ProviderOptions;
     hooks?: ToolHooks;
+    runScope: ReturnType<typeof createRunScope>;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     return {
@@ -323,12 +331,22 @@ export class AgentLegacyHandler {
         });
 
         // The legacy path has no abort signal to forward to the hook.
-        const fireClientHooks = () =>
-          fireClientToolOutputHooks({
+        const fireClientHooks = async () => {
+          await fireClientToolOutputHooks({
             messages,
             tools: convertedTools,
             logger: this.capabilities.logger,
           });
+          // Enrich ingested client tool results with the server tool's
+          // toModelOutput. The legacy v4 prompt conversion does not consume the
+          // metadata, but it persists with the message so later requests on the
+          // current paths restore the mapped output.
+          await applyClientToolModelOutput({
+            messageList,
+            tools: convertedTools,
+            logger: this.capabilities.logger,
+          });
+        };
 
         let messageList = new MessageList({
           threadId,
@@ -442,11 +460,21 @@ export class AgentLegacyHandler {
           });
         }
 
+        const memoryRunState = new MemoryRunState({
+          memory,
+          threadId,
+          resourceId,
+          thread: threadObject ?? null,
+          ownershipValidated: true,
+        });
+        runScope.set(LEGACY_MEMORY_RUN_STATE_KEY, memoryRunState);
+
         // Set memory context in RequestContext for processors to access
         requestContext.set('MastraMemory', {
           thread: threadObject,
           resourceId,
           memoryConfig,
+          runState: () => runScope.get(LEGACY_MEMORY_RUN_STATE_KEY),
         });
 
         // Add new user messages to the list
@@ -563,8 +591,10 @@ export class AgentLegacyHandler {
           threadId,
         });
 
-        // re-read the latest thread so metadata written mid-run (working memory, processors) isn't overwritten
         const memory = await this.capabilities.getMemory({ requestContext });
+        const memoryRunState = memory ? getMemoryRunState(requestContext, memory, threadId, resourceId) : undefined;
+        // re-read the latest thread so metadata written mid-run (working memory, processors) isn't overwritten.
+        // This write path stays authoritative and never reads through the run snapshot.
         const thread = (threadId ? await memory?.getThreadById({ threadId }) : undefined) ?? threadAfter;
 
         if (memory && resourceId && thread) {
@@ -588,7 +618,7 @@ export class AgentLegacyHandler {
               messageList.add(responseMessages, 'response');
             }
 
-            if (!threadExists) {
+            if (!threadExists && !memoryRunState?.ownershipValidated) {
               await memory.createThread({
                 threadId: thread.id,
                 metadata: thread.metadata,
@@ -817,7 +847,7 @@ export class AgentLegacyHandler {
         threadId: threadFromArgs?.id,
         resourceId,
       }) ||
-      randomUUID();
+      globalThis.crypto.randomUUID();
     const instructions = args.instructions || (await this.capabilities.getInstructions({ requestContext }));
     const llm = await this.capabilities.getLLM({
       requestContext,
@@ -825,6 +855,7 @@ export class AgentLegacyHandler {
     });
 
     const memory = await this.capabilities.getMemory({ requestContext });
+    const runScope = createRunScope();
 
     const { before, after } = this.__primitive({
       messages,
@@ -843,6 +874,7 @@ export class AgentLegacyHandler {
       inputProcessors,
       providerOptions: args.providerOptions,
       hooks,
+      runScope,
       ...resolveObservabilityContext(args as Partial<ObservabilityContext>),
     });
 
@@ -1013,7 +1045,7 @@ export class AgentLegacyHandler {
         usage: { totalTokens: 0, promptTokens: 0, completionTokens: 0 },
         finishReason: 'other',
         response: {
-          id: randomUUID(),
+          id: globalThis.crypto.randomUUID(),
           timestamp: new Date(),
           modelId: 'tripwire',
           messages: [],
@@ -1088,7 +1120,7 @@ export class AgentLegacyHandler {
           usage: { totalTokens: 0, promptTokens: 0, completionTokens: 0 },
           finishReason: 'other',
           response: {
-            id: randomUUID(),
+            id: globalThis.crypto.randomUUID(),
             timestamp: new Date(),
             modelId: 'tripwire',
             messages: [],
@@ -1218,7 +1250,7 @@ export class AgentLegacyHandler {
         usage: { totalTokens: 0, promptTokens: 0, completionTokens: 0 },
         finishReason: 'other',
         response: {
-          id: randomUUID(),
+          id: globalThis.crypto.randomUUID(),
           timestamp: new Date(),
           modelId: 'tripwire',
           messages: [],
@@ -1364,7 +1396,7 @@ export class AgentLegacyHandler {
         finishReason: Promise.resolve('other'),
         tripwire: beforeResult.tripwire,
         response: {
-          id: randomUUID(),
+          id: globalThis.crypto.randomUUID(),
           timestamp: new Date(),
           modelId: 'tripwire',
           messages: [],

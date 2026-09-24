@@ -14,10 +14,17 @@ import {
   stopProcessMemoryDiagnosticsWithTimeout,
   type ProcessMemoryDiagnostics,
 } from '@mastra/code-sdk/process-memory-diagnostics';
-import { setupDebugLogging } from '@mastra/code-sdk/utils/debug-log';
+import { setupDebugLogging, truncateLogFile } from '@mastra/code-sdk/utils/debug-log';
 import { drainPipedStdin, reopenStdinFromTTY } from '@mastra/code-sdk/utils/stdin-pipe';
 import { releaseAllThreadLocks } from '@mastra/code-sdk/utils/thread-lock';
-import { createShutdownCoordinator, startTuiProcessMemoryDiagnostics } from './process-memory-diagnostics-lifecycle.js';
+import { TUI_CO_AUTHOR } from './commit-attribution.js';
+import { initialMessageOptions, pipedInputConflict, takeInitialPrompt } from './initial-prompt.js';
+import {
+  createOneShotFatalErrorHandler,
+  createShutdownCoordinator,
+  startTuiProcessMemoryDiagnostics,
+} from './process-memory-diagnostics-lifecycle.js';
+import { resolveTuiSubagents } from './subagent-settings.js';
 import { detectTerminalTheme } from './tui/detect-theme.js';
 import { MastraTUI } from './tui/index.js';
 import { applyThemeMode, restoreTerminalForeground } from './tui/theme.js';
@@ -35,6 +42,8 @@ let tui: MastraTUI | undefined;
 let processMemoryDiagnostics: ProcessMemoryDiagnostics | undefined;
 let storageClosed = false;
 let cleanupPromise: Promise<void> | null = null;
+
+const CRASH_LOG_PATH = '/tmp/mastra-crash.log';
 
 function isTruthyEnv(name: string): boolean {
   return ['1', 'true', 'yes', 'on'].includes(process.env[name]?.trim().toLowerCase() ?? '');
@@ -60,7 +69,7 @@ process.on('unhandledRejection', reason => {
   handleFatalError(reason instanceof Error ? reason : new Error(String(reason)));
 });
 
-async function tuiMain(pipedInput?: string | null) {
+async function tuiMain(startupMessage: ReturnType<typeof initialMessageOptions> = {}) {
   const settings = loadSettings();
   processMemoryDiagnostics = await startTuiProcessMemoryDiagnostics(process.env, warning => {
     console.info(`⚠ ${warning}`);
@@ -73,9 +82,11 @@ async function tuiMain(pipedInput?: string | null) {
 
   const initialState = resolveInitialStateFromEnv();
   const result = await createMastraCode({
+    coAuthor: TUI_CO_AUTHOR,
     unixSocketPubSub: !isTruthyEnv('MASTRACODE_DISABLE_UNIX_SOCKET_PUBSUB'),
     disableMcp: isTruthyEnv('MASTRACODE_DISABLE_MCP'),
     disableHooks: isTruthyEnv('MASTRACODE_DISABLE_HOOKS'),
+    subagents: resolveTuiSubagents(settings.preferences.subagentsEnabled),
     ...(isTruthyEnv('MASTRACODE_DISABLE_MEMORY') ? { memory: false as never } : {}),
     ...(initialState ? { initialState: initialState as never } : {}),
   });
@@ -148,8 +159,10 @@ async function tuiMain(pipedInput?: string | null) {
     version: getCurrentVersion(),
     inlineQuestions: true,
     githubSignals: result.githubSignals,
+    backgroundToolsEnabled: result.backgroundToolsEnabled,
+    backgroundCompletionEvents: result.backgroundCompletionEvents,
     exit: exitCode => void shutdownAndExit(exitCode),
-    ...(pipedInput ? { initialMessage: `The following was piped via stdin:\n\n${pipedInput}` } : {}),
+    ...startupMessage,
   });
   tui.run().catch(error => {
     handleFatalError(error);
@@ -292,9 +305,13 @@ function readFlag(args: string[], flag: string): string | undefined {
   return value;
 }
 
-function handleFatalError(error: unknown): void {
+const handleFatalError = createOneShotFatalErrorHandler((error: unknown): void => {
   // Always write to real stderr, even if console.error was overridden
-  const write = (msg: string) => process.stderr.write(msg + '\n');
+  const write = (msg: string) => {
+    try {
+      process.stderr.write(msg + '\n');
+    } catch {}
+  };
 
   if (hasEconnrefused(error)) {
     const settings = loadSettings();
@@ -319,7 +336,9 @@ function handleFatalError(error: unknown): void {
   // Write crash log to file so it persists even if terminal closes
   try {
     const crashLog = `[${new Date().toISOString()}] ${msg}\n${error instanceof Error && error.stack ? error.stack + '\n' : ''}`;
-    fs.appendFileSync('/tmp/mastra-crash.log', crashLog);
+    truncateLogFile(CRASH_LOG_PATH);
+    fs.appendFileSync(CRASH_LOG_PATH, crashLog);
+    truncateLogFile(CRASH_LOG_PATH);
   } catch {}
   if (error instanceof Error && error.stack) {
     write(error.stack);
@@ -329,20 +348,41 @@ function handleFatalError(error: unknown): void {
     tui?.stop();
   } catch {}
   void shutdownAndExit(1);
-}
+});
 
 async function main() {
   if (process.argv[2] === 'plugin') {
     return pluginMain(process.argv.slice(3));
   }
 
-  if (hasHeadlessFlag(process.argv) || process.argv.includes('--help') || process.argv.includes('-h')) {
-    return runMCCli();
+  const initialPrompt = takeInitialPrompt(process.argv, process.env);
+  if (initialPrompt.error) {
+    process.stderr.write(`${initialPrompt.error}\n`);
+    process.exit(1);
+  }
+  if (initialPrompt.flag) process.argv = initialPrompt.argv;
+  // The flag only means something to the interactive TUI. Paths that can't run
+  // it reject the flag instead of dropping the prompt; an env var prompt is
+  // just ignored there.
+  const rejectInitialPromptFlag = (reason: string) => {
+    if (!initialPrompt.flag) return;
+    process.stderr.write(`${initialPrompt.flag} starts the interactive TUI; ${reason}\n`);
+    process.exit(1);
+  };
+
+  const headless = hasHeadlessFlag(process.argv);
+  if (headless) rejectInitialPromptFlag('use --prompt for headless runs');
+  if (headless || process.argv.includes('--help') || process.argv.includes('-h')) {
+    return runMCCli(undefined, { coAuthor: TUI_CO_AUTHOR });
   }
 
   if (process.argv.includes('--acp')) {
+    rejectInitialPromptFlag('it cannot be combined with --acp');
     const { acpMain } = await import('@mastra/code-sdk/acp/index');
-    return acpMain({ dangerousAutoApprove: process.argv.includes('--dangerous-auto-approve') });
+    return acpMain({
+      dangerousAutoApprove: process.argv.includes('--dangerous-auto-approve'),
+      coAuthor: TUI_CO_AUTHOR,
+    });
   }
 
   // When stdin is piped (e.g. `cat foo | mastracode`), drain the pipe fully
@@ -357,12 +397,19 @@ async function main() {
     // stdin is consumed/closed and the TUI needs a live TTY for keyboard input.
     const reopenedStdin = reopenStdinFromTTY();
     if (!reopenedStdin) {
+      rejectInitialPromptFlag('no TTY is available, so use --prompt for headless runs');
       process.stderr.write('No TTY available — falling back to headless mode.\n');
-      return runMCCli(pipedInput);
+      return runMCCli(pipedInput, { coAuthor: TUI_CO_AUTHOR });
     }
   }
 
-  return tuiMain(pipedInput);
+  const conflict = pipedInputConflict(initialPrompt, pipedInput);
+  if (conflict) {
+    process.stderr.write(`${conflict}\n`);
+    process.exit(1);
+  }
+
+  return tuiMain(initialMessageOptions(initialPrompt, pipedInput));
 }
 
 main().catch(error => {

@@ -61,6 +61,7 @@ describe('MCPClient tool discovery retries', () => {
         weather_getWeather: toolset.getWeather,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(1);
   });
@@ -88,9 +89,104 @@ describe('MCPClient tool discovery retries', () => {
       errors: {
         stock: 'Validation failed',
       },
+      errorDetails: {
+        stock: { message: 'Validation failed' },
+      },
     });
     expect(weatherClient.tools).toHaveBeenCalledTimes(1);
     expect(stockClient.tools).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns structured transport details without removing legacy string errors', async () => {
+    const client = createClient();
+    const transportError = Object.assign(new Error('Error POSTing to endpoint'), {
+      status: 503,
+      code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+    });
+    const connectError = new Error('Failed to connect to MCP server weather', { cause: transportError });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockRejectedValue(connectError);
+
+    const result = await client.listToolDefinitionsWithErrors();
+
+    expect(result).toEqual({
+      definitions: {},
+      errors: {
+        weather: 'Failed to connect to MCP server weather (HTTP 503)',
+      },
+      errorDetails: {
+        weather: {
+          message: 'Failed to connect to MCP server weather (HTTP 503)',
+          httpStatus: 503,
+          code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+        },
+      },
+    });
+  });
+
+  it('exposes structured failures for resource, template, and prompt discovery', async () => {
+    const client = createMultiServerClient();
+    const weatherResources = [{ uri: 'weather://current', name: 'Current weather' }] as any;
+    const weatherTemplates = [{ uriTemplate: 'weather://forecast/{city}', name: 'Forecast' }] as any;
+    const weatherPrompts = [{ name: 'forecast', description: 'Create a forecast' }] as any;
+    const weatherClient = {
+      resources: {
+        list: vi.fn().mockResolvedValue(weatherResources),
+        templates: vi.fn().mockResolvedValue(weatherTemplates),
+      },
+      prompts: {
+        list: vi.fn().mockResolvedValue(weatherPrompts),
+      },
+    } as any;
+    const transportError = Object.assign(new Error('service unavailable'), {
+      status: 503,
+      code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+    });
+    const stockError = new Error('Failed to connect to MCP server stock', { cause: transportError });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockImplementation(async (serverName: string) => {
+      if (serverName === 'stock') throw stockError;
+      return weatherClient;
+    });
+
+    const resources = await client.resources.listWithErrors();
+    const templates = await client.resources.templatesWithErrors();
+    const prompts = await client.prompts.listWithErrors();
+    const expectedDiagnostics = {
+      errors: { stock: 'Failed to connect to MCP server stock (HTTP 503)' },
+      errorDetails: {
+        stock: {
+          message: 'Failed to connect to MCP server stock (HTTP 503)',
+          httpStatus: 503,
+          code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+        },
+      },
+    };
+
+    expect(resources).toEqual({ resources: { weather: weatherResources }, ...expectedDiagnostics });
+    expect(templates).toEqual({ templates: { weather: weatherTemplates }, ...expectedDiagnostics });
+    expect(prompts).toEqual({ prompts: { weather: weatherPrompts }, ...expectedDiagnostics });
+
+    await expect(client.resources.list()).resolves.toEqual({ weather: weatherResources });
+    await expect(client.resources.templates()).resolves.toEqual({ weather: weatherTemplates });
+    await expect(client.prompts.list()).resolves.toEqual({ weather: weatherPrompts });
+  });
+
+  it('keeps aggregate discovery isolated when an error metadata accessor throws', async () => {
+    const client = createClient();
+    const hostileError = new Proxy(Object.create(null) as object, {
+      get() {
+        throw new Error('metadata accessor failed');
+      },
+    });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockRejectedValue(hostileError);
+
+    await expect(client.listToolsWithErrors()).resolves.toEqual({
+      tools: {},
+      errors: { weather: 'Unknown error' },
+      errorDetails: { weather: { message: 'Unknown error' } },
+    });
   });
 
   it('returns healthy tools and timing diagnostics when another server exceeds its discovery budget', async () => {
@@ -119,6 +215,9 @@ describe('MCPClient tool discovery retries', () => {
       errors: {
         stock: 'Discovery timed out after 50ms',
       },
+      errorDetails: {
+        stock: { message: 'Discovery timed out after 50ms' },
+      },
       durations: {
         weather: 0,
         stock: 50,
@@ -145,11 +244,13 @@ describe('MCPClient tool discovery retries', () => {
     expect(toolsetsResult).toEqual({
       toolsets: { weather: toolset },
       errors: {},
+      errorDetails: {},
       durations: { weather: 0 },
     });
     expect(definitionsResult).toEqual({
       definitions: { weather: definitions },
       errors: {},
+      errorDetails: {},
       durations: { weather: 0 },
     });
     expect(vi.getTimerCount()).toBe(0);
@@ -172,6 +273,7 @@ describe('MCPClient tool discovery retries', () => {
         weather_getWeather: toolset.getWeather,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(2);
     expect(reconnectSpy).toHaveBeenCalledTimes(1);
@@ -201,6 +303,7 @@ describe('MCPClient tool discovery retries', () => {
         stock_search: stockTools.search,
       },
       errors: {},
+      errorDetails: {},
     });
   });
 
@@ -221,6 +324,7 @@ describe('MCPClient tool discovery retries', () => {
         weather: toolset,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(2);
     expect(reconnectSpy).toHaveBeenCalledTimes(1);
@@ -242,6 +346,9 @@ describe('MCPClient tool discovery retries', () => {
       toolsets: {},
       errors: {
         weather: 'Validation failed',
+      },
+      errorDetails: {
+        weather: { message: 'Validation failed' },
       },
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(1);
@@ -269,11 +376,7 @@ describe('MCPClient tool discovery retries', () => {
   });
 
   it('forwards per-server capabilities into InternalMastraMCPClient', async () => {
-    const customCapabilities = {
-      elicitation: {
-        supportedContentTypes: ['text/uri-list', 'application/vnd.mastra.form+json'],
-      },
-    } as any;
+    const customCapabilities = { elicitation: { form: {}, url: {} } };
 
     const connectSpy = vi.spyOn(InternalMastraMCPClient.prototype, 'connect').mockResolvedValue(true);
 
@@ -281,8 +384,9 @@ describe('MCPClient tool discovery retries', () => {
       id: `configuration-test-${++clientId}`,
       servers: {
         weather: {
-          url: new URL('http://localhost:1234/sse'),
+          url: new URL('http://localhost:1234/mcp'),
           capabilities: customCapabilities,
+          inputRequests: async () => ({ action: 'decline' }),
         },
       },
     });
@@ -296,27 +400,45 @@ describe('MCPClient tool discovery retries', () => {
     expect(capabilities).toMatchObject(customCapabilities);
   });
 
-  it('registers elicitation handlers before connecting the server', async () => {
+  it('advertises form elicitation when an inputRequests handler is configured', async () => {
     const connectSpy = vi.spyOn(InternalMastraMCPClient.prototype, 'connect').mockResolvedValue(true);
 
     const client = new MCPClient({
       id: `configuration-test-${++clientId}`,
       servers: {
         weather: {
-          url: new URL('http://localhost:1234/sse'),
+          url: new URL('http://localhost:1234/mcp'),
+          inputRequests: async () => ({ action: 'decline' }),
+        },
+        silent: {
+          url: new URL('http://localhost:5678/mcp'),
         },
       },
     });
 
     clients.push(client);
 
-    await client.elicitation.onRequest('weather', async () => ({ action: 'decline' }));
+    const withHandler = (await (client as any).getConnectedClientForServer('weather')).client._capabilities;
+    const withoutHandler = (await (client as any).getConnectedClientForServer('silent')).client._capabilities;
 
-    const internalClient = (client as any).mcpClientsById.get('weather');
-    const capabilities = internalClient.client._capabilities;
+    expect(connectSpy).toHaveBeenCalledTimes(2);
+    expect(withHandler.elicitation).toEqual({ form: {} });
+    expect(withoutHandler.elicitation).toBeUndefined();
+  });
 
-    expect(connectSpy).not.toHaveBeenCalled();
-    expect(capabilities.elicitation).toMatchObject({ form: {} });
+  it('rejects an elicitation capability without an inputRequests handler', async () => {
+    const client = new MCPClient({
+      id: `configuration-test-${++clientId}`,
+      servers: {
+        weather: {
+          url: new URL('http://localhost:1234/mcp'),
+          capabilities: { elicitation: { form: {} } },
+        },
+      },
+    });
+    clients.push(client);
+
+    await expect((client as any).getConnectedClientForServer('weather')).rejects.toThrow(/inputRequests/);
   });
 
   it('returns cached server instructions for configured servers', async () => {

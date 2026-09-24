@@ -51,6 +51,7 @@ const serializedStepFlowEntrySchema = z.object({
     'step',
     'agent',
     'tool',
+    'classifier',
     'mapping',
     'sleep',
     'sleepUntil',
@@ -61,6 +62,12 @@ const serializedStepFlowEntrySchema = z.object({
     'foreach',
     'workflow',
   ]),
+  // Identity/display fields shared by declarative and control-flow entries.
+  // This schema documents responses (OpenAPI/generated clients); it is not
+  // parsed at runtime, so per-type fields beyond these stay untyped.
+  id: z.string().optional(),
+  description: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 /**

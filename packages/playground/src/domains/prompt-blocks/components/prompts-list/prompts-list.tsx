@@ -2,7 +2,9 @@ import type { StoredPromptBlockResponse } from '@mastra/client-js';
 import {
   DataList as EntityList,
   DataListSkeleton as EntityListSkeleton,
+  useDataListKeyboard,
 } from '@mastra/playground-ui/components/DataList';
+import type { DataListSort } from '@mastra/playground-ui/components/DataList';
 import { truncateString } from '@mastra/playground-ui/utils/truncate-string';
 import { CheckIcon } from 'lucide-react';
 import { useMemo } from 'react';
@@ -16,7 +18,11 @@ export interface PromptsListProps {
   hasMore?: boolean;
   onNextPage?: () => void;
   onPrevPage?: () => void;
+  updatedSort?: DataListSort;
+  onSortChange?: (sort: DataListSort, key: string) => void;
 }
+
+const COLUMNS = 'auto 1fr auto auto auto';
 
 export function PromptsList({
   promptBlocks,
@@ -26,6 +32,8 @@ export function PromptsList({
   hasMore,
   onNextPage,
   onPrevPage,
+  updatedSort,
+  onSortChange,
 }: PromptsListProps) {
   const { paths, Link } = useLinkComponent();
 
@@ -36,27 +44,41 @@ export function PromptsList({
     );
   }, [promptBlocks, search]);
 
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: filteredData.length, global: true });
+
   if (isLoading) {
-    return <EntityListSkeleton columns="auto 1fr auto auto" />;
+    return <EntityListSkeleton columns={COLUMNS} />;
   }
 
   return (
-    <EntityList columns="auto 1fr auto auto" variant="striped">
+    <EntityList columns={COLUMNS} scrollRef={containerRef}>
       <EntityList.Top>
         <EntityList.TopCell>Name</EntityList.TopCell>
         <EntityList.TopCell>Description</EntityList.TopCell>
         <EntityList.TopCell className="text-center">Has Draft</EntityList.TopCell>
         <EntityList.TopCell className="text-center">Is Published</EntityList.TopCell>
+        {onSortChange ? (
+          <EntityList.SortableTopCell sortKey="updatedAt" sort={updatedSort} onSortChange={onSortChange}>
+            Updated
+          </EntityList.SortableTopCell>
+        ) : (
+          <EntityList.TopCell>Updated</EntityList.TopCell>
+        )}
       </EntityList.Top>
 
       {filteredData.length === 0 && search ? <EntityList.NoMatch message="No Prompts match your search" /> : null}
 
-      {filteredData.map(block => {
+      {filteredData.map((block, index) => {
         const name = truncateString(block.name, 50);
         const description = truncateString(block.description ?? '', 200);
 
         return (
-          <EntityList.RowLink key={block.id} to={paths.cmsPromptBlockEditLink(block.id)} LinkComponent={Link}>
+          <EntityList.RowLink
+            key={block.id}
+            to={paths.cmsPromptBlockEditLink(block.id)}
+            LinkComponent={Link}
+            {...getRowProps(index)}
+          >
             <EntityList.NameCell>{name}</EntityList.NameCell>
             <EntityList.DescriptionCell>{description}</EntityList.DescriptionCell>
             <EntityList.TextCell className="text-center">
@@ -65,6 +87,7 @@ export function PromptsList({
             <EntityList.TextCell className="text-center">
               {block.activeVersionId && <CheckIcon className="mx-auto size-4" />}
             </EntityList.TextCell>
+            <EntityList.DateCell timestamp={block.updatedAt} />
           </EntityList.RowLink>
         );
       })}

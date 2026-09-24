@@ -2,10 +2,14 @@ import type { McpServerListResponse } from '@mastra/client-js';
 import {
   DataList as EntityList,
   DataListSkeleton as EntityListSkeleton,
+  useDataListKeyboard,
 } from '@mastra/playground-ui/components/DataList';
+import type { DataListSort } from '@mastra/playground-ui/components/DataList';
 import { AgentIcon } from '@mastra/playground-ui/icons/AgentIcon';
 import { ToolsIcon } from '@mastra/playground-ui/icons/ToolsIcon';
 import { WorkflowIcon } from '@mastra/playground-ui/icons/WorkflowIcon';
+import { sortBy } from '@mastra/playground-ui/sort/sort-by';
+import type { ListSort } from '@mastra/playground-ui/sort/sort-by';
 import { truncateString } from '@mastra/playground-ui/utils/truncate-string';
 import { useMastraClient } from '@mastra/react';
 import { useMemo } from 'react';
@@ -14,17 +18,30 @@ import { useLinkComponent } from '@/lib/framework';
 
 type McpServer = McpServerListResponse['servers'][number];
 
+export type McpServersSortKey = 'name';
+export type McpServersSort = ListSort<McpServersSortKey>;
+
 export interface McpServersListProps {
   mcpServers: McpServer[];
   isLoading: boolean;
   search?: string;
+  sort?: McpServersSort;
+  onSortChange?: (direction: DataListSort, key: McpServersSortKey) => void;
 }
 
-function McpServerRow({ server }: { server: McpServer }) {
+const sortAccessors = {
+  name: (server: McpServer) => server.name || server.id,
+};
+
+function McpServerRow({ server, rowProps }: { server: McpServer; rowProps?: Record<string, unknown> }) {
   const { paths, Link } = useLinkComponent();
   const client = useMastraClient();
   const baseUrl = client.options.baseUrl;
-  const sseUrl = baseUrl ? `${baseUrl}/api/mcp/${server.id}/sse` : '';
+  // MCP v2 servers only serve Streamable HTTP; 1.x servers are listed by their SSE endpoint.
+  // Servers that predate transport reporting are 1.x, so absence means SSE is available.
+  const hasSse = server.transports?.includes('sse') ?? true;
+  const transportPath = hasSse ? 'sse' : 'mcp';
+  const serverUrl = baseUrl ? `${baseUrl}/api/mcp/${server.id}/${transportPath}` : '';
 
   const { data: tools } = useMCPServerTools(server);
   const toolsList = Object.values(tools || {});
@@ -35,9 +52,9 @@ function McpServerRow({ server }: { server: McpServer }) {
   const name = truncateString(server.name, 50);
 
   return (
-    <EntityList.RowLink to={paths.mcpServerLink(server.id)} LinkComponent={Link}>
+    <EntityList.RowLink to={paths.mcpServerLink(server.id)} LinkComponent={Link} {...rowProps}>
       <EntityList.NameCell>{name}</EntityList.NameCell>
-      <EntityList.DescriptionCell>{sseUrl}</EntityList.DescriptionCell>
+      <EntityList.DescriptionCell>{serverUrl}</EntityList.DescriptionCell>
       <EntityList.TextCell className="text-center">{agentToolsCount || ''}</EntityList.TextCell>
       <EntityList.TextCell className="text-center">{toolsCount || ''}</EntityList.TextCell>
       <EntityList.TextCell className="text-center">{workflowToolsCount || ''}</EntityList.TextCell>
@@ -45,22 +62,36 @@ function McpServerRow({ server }: { server: McpServer }) {
   );
 }
 
-export function McpServersList({ mcpServers, isLoading, search = '' }: McpServersListProps) {
+export function McpServersList({ mcpServers, isLoading, search = '', sort, onSortChange }: McpServersListProps) {
   const filteredData = useMemo(() => {
     const term = search.toLowerCase();
-    return mcpServers.filter(
-      server => server.name?.toLowerCase().includes(term) || server.id?.toLowerCase().includes(term),
+    return sortBy(
+      mcpServers.filter(server => server.name?.toLowerCase().includes(term) || server.id?.toLowerCase().includes(term)),
+      sort,
+      sortAccessors,
     );
-  }, [mcpServers, search]);
+  }, [mcpServers, search, sort]);
+
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: filteredData.length, global: true });
 
   if (isLoading) {
     return <EntityListSkeleton columns="auto 1fr auto auto auto" />;
   }
 
   return (
-    <EntityList columns="auto 1fr auto auto auto" variant="striped">
+    <EntityList columns="auto 1fr auto auto auto" scrollRef={containerRef}>
       <EntityList.Top>
-        <EntityList.TopCell>Name</EntityList.TopCell>
+        {onSortChange ? (
+          <EntityList.SortableTopCell
+            sortKey="name"
+            sort={sort?.key === 'name' ? sort.direction : undefined}
+            onSortChange={onSortChange}
+          >
+            Name
+          </EntityList.SortableTopCell>
+        ) : (
+          <EntityList.TopCell>Name</EntityList.TopCell>
+        )}
         <EntityList.TopCell>URL</EntityList.TopCell>
         <EntityList.TopCellSmart long="Agents" short={<AgentIcon />} tooltip="Agent Tools" className="text-center" />
         <EntityList.TopCellSmart long="Tools" short={<ToolsIcon />} tooltip="Tools" className="text-center" />
@@ -74,8 +105,8 @@ export function McpServersList({ mcpServers, isLoading, search = '' }: McpServer
 
       {filteredData.length === 0 && search ? <EntityList.NoMatch message="No MCP Servers match your search" /> : null}
 
-      {filteredData.map(server => (
-        <McpServerRow key={server.id} server={server} />
+      {filteredData.map((server, index) => (
+        <McpServerRow key={server.id} server={server} rowProps={getRowProps(index)} />
       ))}
     </EntityList>
   );

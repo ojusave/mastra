@@ -252,6 +252,112 @@ describe('WorkflowsList', () => {
     });
   });
 
+  describe('when navigating with the keyboard', () => {
+    const interactiveRows = () => Array.from(document.querySelectorAll<HTMLElement>('[data-row-index]'));
+
+    it('applies a roving tabindex to workflow link rows only', async () => {
+      useRunCountsHandler();
+      const { queryClient } = renderList();
+
+      const rowElements = interactiveRows();
+      expect(rowElements.length).toBeGreaterThan(1);
+      // The RowWrapper is the focus target; the link inside is out of the tab order.
+      expect(rowElements.every(row => row.tagName === 'DIV')).toBe(true);
+      expect(rowElements.every(row => row.querySelector('a')?.tabIndex === -1)).toBe(true);
+      expect(rowElements.map(row => row.tabIndex)).toEqual([0, ...rowElements.slice(1).map(() => -1)]);
+
+      await waitForMutationsIdle(queryClient);
+    });
+
+    it('moves focus between rows with ArrowDown/ArrowUp and jumps with Home/End', async () => {
+      useRunCountsHandler();
+      const { queryClient } = renderList();
+
+      const rowElements = interactiveRows();
+      fireEvent.focus(rowElements[0]);
+      fireEvent.keyDown(rowElements[0], { key: 'ArrowDown' });
+      expect(document.activeElement).toBe(rowElements[1]);
+
+      fireEvent.keyDown(rowElements[1], { key: 'End' });
+      expect(document.activeElement).toBe(rowElements[rowElements.length - 1]);
+
+      fireEvent.keyDown(rowElements[rowElements.length - 1], { key: 'Home' });
+      expect(document.activeElement).toBe(rowElements[0]);
+
+      await waitForMutationsIdle(queryClient);
+    });
+
+    it('skips inline non-link rows when expanded children are not registered', async () => {
+      useRunCountsHandler();
+      const { queryClient } = renderList();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Expand nested workflows of prd-groom-product' }));
+      const inlineRow = screen.getByText('use-case-arch').closest('.data-list-row') as HTMLElement;
+
+      // Inline rows never receive a roving tabindex slot.
+      expect(inlineRow.querySelector('[data-row-index]')).toBeNull();
+
+      // Indices stay contiguous across only the interactive rows.
+      const indices = interactiveRows().map(row => Number(row.dataset.rowIndex));
+      expect(indices).toEqual(indices.map((_, i) => i));
+
+      await waitForMutationsIdle(queryClient);
+    });
+  });
+
+  describe('when sorted from the Name column', () => {
+    const rootNames = () =>
+      Array.from(document.querySelectorAll<HTMLAnchorElement>('[data-row-index] > a')).map(link =>
+        link.getAttribute('href')?.replace('/workflows/', ''),
+      );
+
+    it('orders root workflows A to Z, then Z to A when the header is toggled', async () => {
+      useRunCountsHandler();
+      const onSortChange = vi.fn();
+      const { queryClient, rerender } = renderList({ onSortChange });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Name, not sorted, sort ascending' }));
+      expect(onSortChange).toHaveBeenCalledWith('asc', 'name');
+
+      rerender(
+        <LinkComponentProvider Link={StubLink} navigate={() => {}} paths={paths}>
+          <WorkflowsList
+            workflows={workflowsFixture}
+            isLoading={false}
+            sort={{ key: 'name', direction: 'asc' }}
+            onSortChange={onSortChange}
+          />
+        </LinkComponentProvider>,
+      );
+      expect(rootNames()).toEqual([
+        'engRunner',
+        'loopA',
+        'loopB',
+        'prdFixProduct',
+        'prdGroomProduct',
+        'prdShipProduct',
+      ]);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Name, sorted ascending, sort descending' }));
+      expect(onSortChange).toHaveBeenLastCalledWith('desc', 'name');
+
+      await waitForMutationsIdle(queryClient);
+    });
+  });
+
+  describe('when sorted from the Running column', () => {
+    it('puts the workflow with the most running runs first when descending', async () => {
+      useRunCountsHandler();
+      const { queryClient } = renderList({ sort: { key: 'running', direction: 'desc' }, onSortChange: () => {} });
+
+      await screen.findByLabelText('3 runs in progress');
+      const firstRow = document.querySelector<HTMLElement>('[data-row-index="0"]');
+      expect(firstRow?.textContent).toContain('eng-runner');
+
+      await waitForMutationsIdle(queryClient);
+    });
+  });
+
   describe('when workflows carry an origin field', () => {
     it("shows the Dynamic badge only for origin: 'dynamic'", async () => {
       useRunCountsHandler();

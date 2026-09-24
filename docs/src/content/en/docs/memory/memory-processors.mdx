@@ -1,6 +1,6 @@
 ---
 title: "Memory processors | Memory"
-description: "Learn how to use memory processors in Mastra to filter, trim, and transform messages before they're sent to the language model to manage context window limits."
+description: "Configure Mastra memory processors to filter, trim, transform, and deduplicate messages before they reach the model while managing context limits."
 packages:
   - "@mastra/core"
   - "@mastra/libsql"
@@ -20,6 +20,12 @@ Memory processors are [processors](/docs/agents/processors) that operate specifi
 ## Built-in memory processors
 
 Mastra automatically adds these processors when memory is enabled:
+
+### `MemoryInputFilter`
+
+Trims client-echoed history before memory loaders run. For an existing thread, it keeps only the current user turn or new tool results. For an empty thread, it keeps the full initial input and removes provider item metadata from assistant parts that could refer to items that don't exist in storage.
+
+This processor runs first so `MessageHistory`, `SemanticRecall`, and Observational Memory receive only the new input they need.
 
 ### `MessageHistory`
 
@@ -213,7 +219,7 @@ Understanding the execution order is important when combining guardrails with me
 [Memory Processors] → [Your inputProcessors]
 ```
 
-1. **Memory processors run FIRST**: `WorkingMemory`, `MessageHistory`, `SemanticRecall`
+1. **Memory processors run FIRST**: `MemoryInputFilter`, then `WorkingMemory`, `MessageHistory`, and `SemanticRecall`
 1. **Your input processors run AFTER**: guardrails, filters, validators
 
 As a result, memory loads message history before your processors can validate or filter the input.

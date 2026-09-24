@@ -13,12 +13,13 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { server } from '../../../../../../e2e/ui/msw-server';
 import { TEST_BASE_URL, renderWithProviders, waitForMutationsIdle } from '../../../../../../e2e/ui/render';
 import { ChatSessionContext } from '../../../chat/context/ChatSessionContext';
-import type { FactoryUserSession } from '../../services/github';
+import type { FactoryUserSession } from '../../services/user-sessions';
 import { WorkspacesSection } from '../WorkspacesSection';
 
 const projectRepositoryId = 'ghp-1';
 
 function reviewSession(index: number): FactoryUserSession {
+  const createdAt = `2026-07-23T00:00:${String(index).padStart(2, '0')}.000Z`;
   return {
     id: `row-${index}`,
     sessionId: `sess-${index}`,
@@ -31,14 +32,14 @@ function reviewSession(index: number): FactoryUserSession {
     sandboxId: null,
     sandboxWorkdir: null,
     materializedAt: null,
-    createdAt: '2026-07-23T00:00:00.000Z',
-    updatedAt: `2026-07-23T00:00:${String(index).padStart(2, '0')}.000Z`,
+    createdAt,
+    updatedAt: createdAt,
   };
 }
 
 function stubSessions(sessions: FactoryUserSession[]) {
   server.use(
-    http.get(`${TEST_BASE_URL}/web/github/projects/${projectRepositoryId}/sessions`, () =>
+    http.get(`${TEST_BASE_URL}/web/source-control/projects/${projectRepositoryId}/sessions`, () =>
       HttpResponse.json({ sessions }),
     ),
     http.get(`${TEST_BASE_URL}/web/factory/projects/fp-1/work-items`, () => HttpResponse.json({ items: [] })),
@@ -55,7 +56,6 @@ function renderSection() {
           resourceReady: false,
           sandboxReady: false,
           sandboxPreparing: false,
-          sandboxProgress: undefined,
           resourceEnabled: false,
           factorySessionState: { factoryProjectId: 'fp-1', projectRepositoryId },
           baseUrl: TEST_BASE_URL,
@@ -82,7 +82,6 @@ describe('Workspaces sidebar show more', () => {
     renderSection();
 
     const group = await screen.findByRole('region', { name: 'Review Sessions' });
-    // Latest 5 by updatedAt are visible; the oldest 3 are collapsed.
     expect(await within(group).findAllByRole('button', { name: /^factory\/pr-200\d+$/ })).toHaveLength(5);
     expect(within(group).queryByRole('button', { name: 'factory/pr-20001' })).not.toBeInTheDocument();
 

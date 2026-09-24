@@ -11,9 +11,9 @@ import type { z } from 'zod';
 import type { ActorSignal } from '../../auth/ee/fga-check';
 import type { BackgroundTaskManager } from '../../background-tasks/manager';
 import type { AgentBackgroundConfig } from '../../background-tasks/types';
+import type { ScoringFilter } from '../../evals/predicate';
 import type { SystemMessage } from '../../llm';
-import type { ProviderOptions } from '../../llm/model/provider-options';
-import type { MastraLanguageModel } from '../../llm/model/shared.types';
+import type { MastraLanguageModel, SharedProviderOptions } from '../../llm/model/shared.types';
 import type { ToolCallConcurrency } from '../../loop/types';
 import type { Mastra } from '../../mastra';
 import type { MastraMemory } from '../../memory/memory';
@@ -78,7 +78,7 @@ export interface SerializableModelConfig {
     [key: string]: unknown;
   };
   /** Provider-specific options for the model call */
-  providerOptions?: ProviderOptions;
+  providerOptions?: SharedProviderOptions;
 }
 
 /**
@@ -108,6 +108,8 @@ export interface SerializableScorerEntry {
   scorerName: string;
   /** Optional sampling configuration */
   sampling?: SerializableScoringSamplingConfig;
+  /** Optional eligibility filter (JSON-safe predicate, survives round-trips as-is) */
+  filter?: ScoringFilter;
 }
 
 /**
@@ -141,6 +143,8 @@ export interface SerializableStructuredOutput {
   schema?: JSONSchema7;
   /** Whether to use JSON prompt injection instead of native response format */
   jsonPromptInjection?: boolean | 'system' | 'inline' | 'auto';
+  /** Caller-supplied instructions (see `StructuredOutputOptionsBase.instructions`) */
+  instructions?: string;
   /** Whether to use the parent agent's model for structuring */
   useAgent?: boolean;
   /** Model config for a dedicated structuring model (if different from the main model) */
@@ -195,13 +199,18 @@ export interface SerializableDurableOptions {
   /** Whether error processors are configured (flag only, instances are non-serializable) */
   hasErrorProcessors?: boolean;
   /** Provider-specific options passed to the language model */
-  providerOptions?: ProviderOptions;
+  providerOptions?: SharedProviderOptions;
   /** Structured output configuration */
   structuredOutput?: SerializableStructuredOutput;
   /** When true, the background task check step skips its in-loop wait (external driver handles continuation) */
   skipBgTaskWait?: boolean;
   /** When true, background tasks are disabled for this run (the registry will not receive a BackgroundTaskManager). */
   disableBackgroundTasks?: boolean;
+  /** Execution-scoped background dispatch policy for delegated agents. */
+  backgroundTaskPolicy?: {
+    allowToolDispatch: boolean;
+    allowDelegationDispatch: boolean;
+  };
   /** Tracing options forwarded to the agent/model spans (metadata, tags, requestContextKeys, parentSpanId, hideInput/hideOutput, traceId). */
   tracingOptions?: TracingOptions;
   /**
@@ -558,8 +567,24 @@ export interface RunRegistryEntry {
    * registered on the Mastra instance instead of trusting the entry.
    */
   isPlaceholder?: boolean;
-  /** Resolved tools with execute functions */
+  /**
+   * Resolved tools with execute functions.
+   *
+   * After a durable LLM step runs input processors this holds the per-step
+   * snapshot the model was shown (e.g. only `search_tools` when a
+   * ToolSearchProcessor withholds searchable tools), so the durable tool-call
+   * step resolves exactly what the model could call. Steps seed from
+   * `baseTools` instead, so a narrowed snapshot never shrinks the toolset
+   * later steps (and their processors) start from.
+   */
   tools: Record<string, CoreTool>;
+  /**
+   * The complete resolved toolset for the run, before any per-step processor
+   * narrowing. Set by the durable LLM step the first time it overwrites `tools`
+   * with a per-step snapshot; `resolveRuntimeDependencies` prefers it over
+   * `tools` when seeding a step (issue #22933).
+   */
+  baseTools?: Record<string, CoreTool>;
   /** SaveQueueManager for message persistence (undefined when memory is not configured) */
   saveQueueManager?: SaveQueueManager;
   /** Memory instance for thread creation and message persistence */
@@ -791,6 +816,15 @@ export interface RunRegistryEntry {
    * and structured output degrades to raw text.
    */
   structuredOutput?: StructuredOutputOptions;
+  /**
+   * Call-time `returnScorerData` flag. Also serialized into
+   * `SerializableDurableOptions`, but parked here too so warm resume() and
+   * observe() can rebuild `scoringData` on their client-side
+   * `MastraModelOutput` without re-reading the snapshot. Cross-process
+   * engines lose this slot; cold resume restores it from the persisted
+   * workflow input instead.
+   */
+  returnScorerData?: boolean;
 }
 
 /**

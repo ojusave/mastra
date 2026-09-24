@@ -46,14 +46,19 @@ export function renderWithProviders(ui: ReactElement, client: QueryClient = make
 /** Render a hook through the real Query + ApiConfig providers. */
 export function renderHookWithProviders<Result, Props>(
   hook: (props: Props) => Result,
-  options?: Omit<RenderHookOptions<Props>, 'wrapper'> & { client?: QueryClient },
+  options?: Omit<RenderHookOptions<Props>, 'wrapper'> & {
+    client?: QueryClient;
+    /** Extra providers nested inside the base stack, e.g. a feed stream. */
+    inner?: (props: { children: ReactNode }) => ReactElement;
+  },
 ) {
   const client = options?.client ?? makeQueryClient();
+  const Inner = options?.inner;
   return {
     client,
     ...renderHook(hook, {
       ...options,
-      wrapper: ({ children }) => <Wrapper client={client}>{children}</Wrapper>,
+      wrapper: ({ children }) => <Wrapper client={client}>{Inner ? <Inner>{children}</Inner> : children}</Wrapper>,
     }),
   };
 }
@@ -75,5 +80,14 @@ export async function waitForMutationsIdle(client: QueryClient) {
     assertIdle();
     await new Promise(resolve => setTimeout(resolve, 50));
     assertIdle();
+  });
+}
+
+/** The routed page's `PageLayout` header (the sidebar renders its own `banner`). */
+export function findPageHeader(): Promise<HTMLElement> {
+  return waitFor(() => {
+    const header = document.querySelector<HTMLElement>('[data-slot="page-layout"] > header');
+    if (!header) throw new Error('Page header not rendered');
+    return header;
   });
 }

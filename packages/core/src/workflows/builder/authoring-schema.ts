@@ -25,11 +25,22 @@
 import { z } from 'zod';
 
 import type { Predicate } from '../predicate';
+import { validateCron } from '../scheduler/cron';
 
 export const WORKFLOW_BUILDER_MAPPING_CONFIG_DESCRIPTION =
   'An object whose top-level keys become the mapping output fields. Each value must use exactly one canonical source form: { "template": "<text with ${placeholders}>" }, { "value": <constant> }, { "step": "<stepId>", "path": "<field.path>" }, { "initData": true, "path": "<workflow-input-field.path>" }, or { "requestContextPath": "<field.path>" }. IMPORTANT: initData is the boolean true, never a field name string; put the workflow input field name in path. Template placeholders use JavaScript-style ${initData.<field>}, ${inputData.<field>}, ${stepResults.<stepId>.<field>}, ${state.<field>}, or ${requestContext.<field>} — never Handlebars {{...}} and never separate sources/data bindings. May also be provided as a JSON-encoded string of the same object.';
 
-const jsonSchema = z.record(z.string(), z.unknown());
+const jsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
+  z.union([
+    z.null(),
+    z.boolean(),
+    z.string(),
+    z.number().finite(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema),
+  ]),
+);
+const jsonSchema = z.record(z.string(), jsonValueSchema);
 
 const STEP_OPTIONS_DESCRIPTION =
   'JSON-safe subset of step options that round-trips through storage. `onFinish` callbacks and function-valued scorers are NOT supported.';
@@ -55,6 +66,33 @@ const stepOptionsInputSchema = z
   })
   .nullish()
   .describe(STEP_OPTIONS_DESCRIPTION);
+
+const ENTRY_ID_DESCRIPTION =
+  'Optional stable entry id — kebab-case, unique within the workflow. Lets editors and tools address this control-flow entry across edits and serialization.';
+const ENTRY_DESCRIPTION_DESCRIPTION = 'Optional human-readable description of why this control-flow operation exists.';
+const ENTRY_METADATA_DESCRIPTION =
+  'Arbitrary JSON-safe metadata attached to this entry (e.g. a display title for visual editors). Does not affect execution.';
+
+// Identity/display fields shared by every control-flow entry (parallel,
+// conditional, foreach, loop, sleep, sleepUntil, mapping). Container entries
+// additionally take an optional `id`; sleep/sleepUntil/mapping already carry a
+// required one.
+const entryDisplayFields = {
+  description: z.string().optional().describe(ENTRY_DESCRIPTION_DESCRIPTION),
+  metadata: jsonSchema.optional().describe(ENTRY_METADATA_DESCRIPTION),
+};
+const entryDisplayInputFields = {
+  description: z.string().nullish().describe(ENTRY_DESCRIPTION_DESCRIPTION),
+  metadata: z.unknown().nullish().describe(ENTRY_METADATA_DESCRIPTION),
+};
+const containerIdentityFields = {
+  id: z.string().min(1).optional().describe(ENTRY_ID_DESCRIPTION),
+  ...entryDisplayFields,
+};
+const containerIdentityInputFields = {
+  id: z.string().min(1).nullish().describe(ENTRY_ID_DESCRIPTION),
+  ...entryDisplayInputFields,
+};
 
 const agentOutputSchemaDescription =
   "OPTIONAL JSON Schema (Draft 2020-12) describing the structured output the agent must produce for this step. When set, the agent runs with structured output and the step's output IS that shape (not `{ text: string }`). Use this when a downstream step needs a machine-readable field — for example, an agent that reads a listing and emits `{ files: string[] }`, which a subsequent `foreach` iterates over.";
@@ -101,6 +139,47 @@ export const workflowBuilderToolEntryInputSchema = workflowBuilderToolEntrySchem
   })
   .describe(TOOL_ENTRY_DESCRIPTION);
 
+const CLASSIFIER_ENTRY_DESCRIPTION =
+  'Classifier step. Evaluates its complete input with a registered configured classifier and returns { answers, usage }. Route with a following conditional entry using inputData.answers.<question>.choice, inputData.answers.<question>.score, or inputData.answers.<question>.probability. Use a mapping entry before the classifier to reshape its input.';
+
+const classifierOptionsSchema = z
+  .object({
+    maxRetries: z.number().int().nonnegative().optional().describe('Retry count for the classifier model call.'),
+    providerOptions: jsonSchema.optional().describe('JSON-safe provider-specific classifier model options.'),
+    retries: z.number().int().nonnegative().optional().describe('Workflow step retry count, separate from maxRetries.'),
+    metadata: jsonSchema.optional().describe('Arbitrary JSON-safe metadata attached to the step.'),
+  })
+  .optional();
+
+const classifierOptionsInputSchema = z
+  .object({
+    maxRetries: z.number().int().nonnegative().nullish().describe('Retry count for the classifier model call.'),
+    providerOptions: jsonSchema.nullish().describe('JSON-safe provider-specific classifier model options.'),
+    retries: z.number().int().nonnegative().nullish().describe('Workflow step retry count, separate from maxRetries.'),
+    metadata: jsonSchema.nullish().describe('Arbitrary JSON-safe metadata attached to the step.'),
+  })
+  .nullish();
+
+export const workflowBuilderClassifierEntrySchema = z
+  .strictObject({
+    type: z.literal('classifier'),
+    id: z.string().min(1).describe('Step id — kebab-case, unique within the workflow.'),
+    classifierId: z
+      .string()
+      .min(1)
+      .describe('Id of a configured classifier registered on this Mastra instance (from resource discovery).'),
+    description: z.string().optional(),
+    options: classifierOptionsSchema,
+  })
+  .describe(CLASSIFIER_ENTRY_DESCRIPTION);
+
+export const workflowBuilderClassifierEntryInputSchema = workflowBuilderClassifierEntrySchema
+  .extend({
+    description: z.string().nullish(),
+    options: classifierOptionsInputSchema,
+  })
+  .describe(CLASSIFIER_ENTRY_DESCRIPTION);
+
 export const workflowBuilderMappingDescriptorSchema = z
   .union([
     z.object({ value: z.unknown() }).strict().describe('Constant source: { "value": <JSON value> }.'),
@@ -133,6 +212,7 @@ export const workflowBuilderMappingEntrySchema = z
   .strictObject({
     type: z.literal('mapping'),
     id: z.string().min(1).describe('Step id — kebab-case, unique within the workflow.'),
+    ...entryDisplayFields,
     mapConfig: z.string().min(1).describe(`A JSON-ENCODED STRING of ${WORKFLOW_BUILDER_MAPPING_CONFIG_DESCRIPTION}`),
   })
   .describe('Mapping step. Its output is an object whose top-level keys are exactly the keys of mapConfig.');
@@ -141,6 +221,7 @@ export const workflowBuilderMappingEntryInputSchema = z
   .strictObject({
     type: z.literal('mapping'),
     id: z.string().min(1).describe('Step id — kebab-case, unique within the workflow.'),
+    ...entryDisplayInputFields,
     mapConfig: z
       .union([workflowBuilderMappingConfigSchema, z.string().min(1)])
       .describe(WORKFLOW_BUILDER_MAPPING_CONFIG_DESCRIPTION),
@@ -179,12 +260,14 @@ export const workflowBuilderNestedWorkflowEntryInputSchema = workflowBuilderNest
 const executableInnerStepSchema = z.union([
   workflowBuilderAgentEntrySchema,
   workflowBuilderToolEntrySchema,
+  workflowBuilderClassifierEntrySchema,
   workflowBuilderNestedWorkflowEntrySchema,
 ]);
 
 const executableInnerStepInputSchema = z.union([
   workflowBuilderAgentEntryInputSchema,
   workflowBuilderToolEntryInputSchema,
+  workflowBuilderClassifierEntryInputSchema,
   workflowBuilderNestedWorkflowEntryInputSchema,
 ]);
 
@@ -219,7 +302,7 @@ export const workflowBuilderPredicateSchema: z.ZodType<Predicate> = z.lazy(() =>
 );
 
 const PARALLEL_DESCRIPTION =
-  'Parallel container. Each child receives the same preceding input and children must be agent/tool/nested workflow — no nested containers or mappings. The result is an object keyed by each child step id containing that child complete output; downstream steps pluck fields via stepResults.<childId>.<field>.';
+  'Parallel container. Each child receives the same preceding input and children must be agent/tool/classifier/nested workflow — no nested containers or mappings. The result is an object keyed by each child step id containing that child complete output; downstream steps pluck fields via stepResults.<childId>.<field>.';
 const FOREACH_DESCRIPTION =
   'Foreach container. The preceding output MUST be a raw array (not an object with an array field). Each item is passed directly to the child step — no child inputMapping — and the output is an array of child outputs, order preserved. Give the inner step its own unique id.';
 const CONDITIONAL_DESCRIPTION =
@@ -228,12 +311,17 @@ const LOOP_DESCRIPTION =
   '`dowhile` keeps looping while the predicate is TRUE; `dountil` keeps looping until the predicate is TRUE (exit condition). The inner step runs at least once and receives its own previous output on later iterations.';
 
 export const workflowBuilderParallelEntrySchema = z
-  .strictObject({ type: z.literal('parallel'), steps: z.array(executableInnerStepSchema).min(1) })
+  .strictObject({
+    type: z.literal('parallel'),
+    ...containerIdentityFields,
+    steps: z.array(executableInnerStepSchema).min(1),
+  })
   .describe(PARALLEL_DESCRIPTION);
 
 export const workflowBuilderForeachEntrySchema = z
   .strictObject({
     type: z.literal('foreach'),
+    ...containerIdentityFields,
     step: executableInnerStepSchema,
     opts: z
       .object({ concurrency: z.number().int().positive() })
@@ -245,17 +333,20 @@ export const workflowBuilderForeachEntrySchema = z
 export const workflowBuilderSleepEntrySchema = z.strictObject({
   type: z.literal('sleep'),
   id: z.string().min(1),
+  ...entryDisplayFields,
   duration: z.number().nonnegative().describe('Milliseconds to wait. Static number only.'),
 });
 export const workflowBuilderSleepUntilEntrySchema = z.strictObject({
   type: z.literal('sleepUntil'),
   id: z.string().min(1),
+  ...entryDisplayFields,
   date: z.string().min(1).describe('ISO 8601 wall-clock date to wait until. Static string only.'),
 });
 
 export const workflowBuilderConditionalEntrySchema = z
   .strictObject({
     type: z.literal('conditional'),
+    ...containerIdentityFields,
     steps: z.array(executableInnerStepSchema).min(1),
     predicates: z
       .array(workflowBuilderPredicateSchema)
@@ -267,6 +358,7 @@ export const workflowBuilderConditionalEntrySchema = z
 export const workflowBuilderLoopEntrySchema = z
   .strictObject({
     type: z.literal('loop'),
+    ...containerIdentityFields,
     step: executableInnerStepSchema,
     loopType: z.enum(['dowhile', 'dountil']),
     predicate: workflowBuilderPredicateSchema.describe('Declarative predicate — no JS closures.'),
@@ -274,14 +366,20 @@ export const workflowBuilderLoopEntrySchema = z
   .describe(LOOP_DESCRIPTION);
 
 // Container input twins: children use the null-tolerant executable input steps,
-// and foreach's optional opts accept null from strict providers.
+// optional identity/display fields accept null, and foreach's optional opts
+// accept null from strict providers.
 export const workflowBuilderParallelEntryInputSchema = z
-  .strictObject({ type: z.literal('parallel'), steps: z.array(executableInnerStepInputSchema).min(1) })
+  .strictObject({
+    type: z.literal('parallel'),
+    ...containerIdentityInputFields,
+    steps: z.array(executableInnerStepInputSchema).min(1),
+  })
   .describe(PARALLEL_DESCRIPTION);
 
 export const workflowBuilderForeachEntryInputSchema = z
   .strictObject({
     type: z.literal('foreach'),
+    ...containerIdentityInputFields,
     step: executableInnerStepInputSchema,
     opts: z
       .object({ concurrency: z.number().int().positive().nullish() })
@@ -290,9 +388,23 @@ export const workflowBuilderForeachEntryInputSchema = z
   })
   .describe(FOREACH_DESCRIPTION);
 
+export const workflowBuilderSleepEntryInputSchema = z.strictObject({
+  type: z.literal('sleep'),
+  id: z.string().min(1),
+  ...entryDisplayInputFields,
+  duration: z.number().nonnegative().describe('Milliseconds to wait. Static number only.'),
+});
+export const workflowBuilderSleepUntilEntryInputSchema = z.strictObject({
+  type: z.literal('sleepUntil'),
+  id: z.string().min(1),
+  ...entryDisplayInputFields,
+  date: z.string().min(1).describe('ISO 8601 wall-clock date to wait until. Static string only.'),
+});
+
 export const workflowBuilderConditionalEntryInputSchema = z
   .strictObject({
     type: z.literal('conditional'),
+    ...containerIdentityInputFields,
     steps: z.array(executableInnerStepInputSchema).min(1),
     predicates: z
       .array(workflowBuilderPredicateSchema)
@@ -304,6 +416,7 @@ export const workflowBuilderConditionalEntryInputSchema = z
 export const workflowBuilderLoopEntryInputSchema = z
   .strictObject({
     type: z.literal('loop'),
+    ...containerIdentityInputFields,
     step: executableInnerStepInputSchema,
     loopType: z.enum(['dowhile', 'dountil']),
     predicate: workflowBuilderPredicateSchema.describe('Declarative predicate — no JS closures.'),
@@ -313,6 +426,7 @@ export const workflowBuilderLoopEntryInputSchema = z
 export const workflowBuilderGraphEntrySchema = z.discriminatedUnion('type', [
   workflowBuilderAgentEntrySchema,
   workflowBuilderToolEntrySchema,
+  workflowBuilderClassifierEntrySchema,
   workflowBuilderMappingEntrySchema,
   workflowBuilderNestedWorkflowEntrySchema,
   workflowBuilderParallelEntrySchema,
@@ -326,18 +440,68 @@ export const workflowBuilderGraphEntrySchema = z.discriminatedUnion('type', [
 export const workflowBuilderGraphEntryInputSchema = z.discriminatedUnion('type', [
   workflowBuilderAgentEntryInputSchema,
   workflowBuilderToolEntryInputSchema,
+  workflowBuilderClassifierEntryInputSchema,
   workflowBuilderMappingEntryInputSchema,
   workflowBuilderNestedWorkflowEntryInputSchema,
   workflowBuilderParallelEntryInputSchema,
   workflowBuilderForeachEntryInputSchema,
-  workflowBuilderSleepEntrySchema,
-  workflowBuilderSleepUntilEntrySchema,
+  workflowBuilderSleepEntryInputSchema,
+  workflowBuilderSleepUntilEntryInputSchema,
   workflowBuilderConditionalEntryInputSchema,
   workflowBuilderLoopEntryInputSchema,
 ]);
 
 const GRAPH_DESCRIPTION =
-  'The complete ordered top-level graph covering all ten persisted graph families: agent, tool, mapping, nested workflow, parallel, foreach, sleep, sleepUntil, conditional, and loop. Every adjacent pair must compose: the previous output shape must satisfy the next input schema — insert a mapping step whenever shapes differ. The workflow result is exactly the final top-level entry output, so add an explicit final mapping whenever that output does not match outputSchema.';
+  'The complete ordered top-level graph covering all eleven persisted graph families: agent, tool, classifier, mapping, nested workflow, parallel, foreach, sleep, sleepUntil, conditional, and loop. Every adjacent pair must compose: the previous output shape must satisfy the next input schema — insert a mapping step whenever shapes differ. The workflow result is exactly the final top-level entry output, so add an explicit final mapping whenever that output does not match outputSchema.';
+
+const SCHEDULE_DESCRIPTION =
+  'Optional declarative cron schedule(s) for the workflow. A single config or an array (array entries must each provide a unique stable id). Persisted with the definition and re-registered on every boot.';
+
+type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
+
+const workflowBuilderJsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.null(),
+    z.string(),
+    z.number().finite(),
+    z.boolean(),
+    z.array(workflowBuilderJsonValueSchema),
+    z.record(z.string(), workflowBuilderJsonValueSchema),
+  ]),
+);
+
+export const workflowBuilderScheduleConfigSchema = z
+  .strictObject({
+    id: z.string().min(1).optional().describe('Stable schedule id, scoped to the workflow. Required in array form.'),
+    cron: z.string().min(1).describe('Cron expression (5-, 6-, or 7-part).'),
+    timezone: z.string().min(1).optional().describe('Optional IANA timezone.'),
+    inputData: workflowBuilderJsonValueSchema.optional().describe('Static input data for each scheduled run.'),
+    initialState: workflowBuilderJsonValueSchema.optional().describe('Static initial state for each scheduled run.'),
+    requestContext: z
+      .record(z.string(), workflowBuilderJsonValueSchema)
+      .optional()
+      .describe('Request context for each scheduled run.'),
+    metadata: z
+      .record(z.string(), workflowBuilderJsonValueSchema)
+      .optional()
+      .describe('Metadata persisted on the schedule row.'),
+  })
+  .superRefine(({ cron, timezone }, ctx) => {
+    try {
+      validateCron(cron, timezone);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message,
+        path: message.startsWith('Invalid timezone') ? ['timezone'] : ['cron'],
+      });
+    }
+  });
+
+export const workflowBuilderScheduleSchema = z
+  .union([workflowBuilderScheduleConfigSchema, z.array(workflowBuilderScheduleConfigSchema)])
+  .describe(SCHEDULE_DESCRIPTION);
 
 export const workflowBuilderDefinitionSchema = z.strictObject({
   id: z.string().min(1).describe('Workflow id — kebab-case. Preserve the exact requested workflow ID.'),
@@ -348,6 +512,7 @@ export const workflowBuilderDefinitionSchema = z.strictObject({
   stateSchema: z.unknown().optional().describe('Optional JSON Schema for persisted workflow state.'),
   requestContextSchema: z.unknown().optional().describe('Optional JSON Schema for request context values.'),
   graph: z.array(workflowBuilderGraphEntrySchema).min(1).describe(GRAPH_DESCRIPTION),
+  schedule: workflowBuilderScheduleSchema.optional(),
 });
 
 export const workflowBuilderDefinitionInputSchema = z
@@ -363,6 +528,7 @@ export const workflowBuilderDefinitionInputSchema = z
     stateSchema: z.unknown().nullish().describe('Optional JSON Schema for persisted workflow state.'),
     requestContextSchema: z.unknown().nullish().describe('Optional JSON Schema for request context values.'),
     graph: z.array(workflowBuilderGraphEntryInputSchema).min(1).describe(GRAPH_DESCRIPTION),
+    schedule: workflowBuilderScheduleSchema.nullish(),
   })
   .describe(
     'One complete canonical WorkflowDefinition. Submit exactly one complete candidate per attempt — never parallel alternatives. After diagnostics, correct and resubmit the whole definition.',

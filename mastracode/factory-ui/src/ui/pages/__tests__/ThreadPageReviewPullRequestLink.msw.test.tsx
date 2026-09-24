@@ -4,7 +4,7 @@ import { createMemoryRouter, RouterProvider } from 'react-router';
 import { describe, expect, it } from 'vitest';
 
 import { server } from '../../../../e2e/ui/msw-server';
-import { renderWithProviders, TEST_BASE_URL } from '../../../../e2e/ui/render';
+import { findPageHeader, renderWithProviders, TEST_BASE_URL } from '../../../../e2e/ui/render';
 import type { PullRequestSubscription } from '../../domains/factory/services/githubSubscriptions';
 import { createAppRoutes } from '../../router';
 
@@ -118,20 +118,11 @@ function stubThreadRoute(workItem: ReturnType<typeof createWireWorkItem>, subscr
         ],
       }),
     ),
-    http.get(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/sessions`, () =>
+    http.get(`${TEST_BASE_URL}/web/source-control/projects/${REPO_ID}/sessions`, () =>
       HttpResponse.json({ sessions: [workspaceSession] }),
     ),
     http.get(`${TEST_BASE_URL}/web/user-sessions/${SESSION_ID}`, () =>
       HttpResponse.json({ session: workspaceSession }),
-    ),
-    http.post(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/ensure`, () =>
-      HttpResponse.json({
-        resourceId: SESSION_ID,
-        factoryProjectId: FACTORY_ID,
-        projectRepositoryId: REPO_ID,
-        sandboxId: 'sb-1',
-        sandboxWorkdir: '/local/mastra',
-      }),
     ),
     http.post(`${AC}/sessions`, () =>
       HttpResponse.json({ controllerId: 'code', resourceId: SESSION_ID, threadId: THREAD_ID }),
@@ -181,7 +172,7 @@ describe('ThreadPage pull request link placement', () => {
       stubThreadRoute(createWireWorkItem('pull-request'), [otherPullRequestSubscription]);
       renderThreadRoute();
 
-      const factorySession = await screen.findByRole('region', { name: 'Factory session' });
+      const factorySession = await findPageHeader();
       const composer = await screen.findByRole('region', { name: 'Thread composer' });
       const activeReviewLink = await within(factorySession).findByRole('link', {
         name: PULL_REQUEST_ACCESSIBLE_NAME,
@@ -202,7 +193,7 @@ describe('ThreadPage pull request link placement', () => {
       stubThreadRoute(createWireWorkItem('pull-request'), [pullRequestSubscription]);
       renderThreadRoute();
 
-      const factorySession = await screen.findByRole('region', { name: 'Factory session' });
+      const factorySession = await findPageHeader();
       await within(factorySession).findByRole('link', { name: PULL_REQUEST_ACCESSIBLE_NAME });
       const pullRequestLinks = within(factorySession)
         .getAllByRole('link')
@@ -224,7 +215,7 @@ describe('ThreadPage pull request link placement', () => {
       ]);
       renderThreadRoute();
 
-      const factorySession = await screen.findByRole('region', { name: 'Factory session' });
+      const factorySession = await findPageHeader();
       const validLinks = await within(factorySession).findAllByRole('link', {
         name: OTHER_PULL_REQUEST_ACCESSIBLE_NAME,
       });
@@ -248,7 +239,7 @@ describe('ThreadPage pull request link placement', () => {
       ]);
       renderThreadRoute();
 
-      const factorySession = await screen.findByRole('region', { name: 'Factory session' });
+      const factorySession = await findPageHeader();
       await within(factorySession).findByRole('link', { name: OTHER_PULL_REQUEST_ACCESSIBLE_NAME });
       const nonPositiveLinks = within(factorySession)
         .queryAllByRole('link')
@@ -267,7 +258,7 @@ describe('ThreadPage pull request link placement', () => {
       ]);
       renderThreadRoute();
 
-      const factorySession = await screen.findByRole('region', { name: 'Factory session' });
+      const factorySession = await findPageHeader();
       await within(factorySession).findByRole('link', { name: MIXED_CASE_ACCESSIBLE_NAME });
       const activeReviewLinks = within(factorySession)
         .getAllByRole('link')
@@ -282,7 +273,7 @@ describe('ThreadPage pull request link placement', () => {
       server.use(http.get(`${TEST_BASE_URL}/web/github/subscriptions`, () => new HttpResponse(null, { status: 500 })));
       renderThreadRoute();
 
-      const factorySession = await screen.findByRole('region', { name: 'Factory session' });
+      const factorySession = await findPageHeader();
       const activeReviewLink = await within(factorySession).findByRole('link', {
         name: PULL_REQUEST_ACCESSIBLE_NAME,
       });
@@ -299,7 +290,7 @@ describe('ThreadPage pull request link placement', () => {
       stubThreadRoute(createWireWorkItem('issue'), [pullRequestSubscription]);
       renderThreadRoute();
 
-      const factorySession = await screen.findByRole('region', { name: 'Factory session' });
+      const factorySession = await findPageHeader();
       const composer = await screen.findByRole('region', { name: 'Thread composer' });
       const link = await within(composer).findByRole('link', { name: PULL_REQUEST_ACCESSIBLE_NAME });
 

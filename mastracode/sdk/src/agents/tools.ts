@@ -1,5 +1,6 @@
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
+import type { ToolsInput } from '@mastra/core/agent';
 import type { AgentControllerRequestContext } from '@mastra/core/agent-controller';
 import { createNotificationInboxTool, NotificationsStorage } from '@mastra/core/notifications';
 import type {
@@ -7,6 +8,7 @@ import type {
   ListDueNotificationsInput,
   ListNotificationsInput,
   UpdateNotificationInput,
+  UpdateNotificationsStatusInput,
 } from '@mastra/core/notifications';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { MastraCompositeStore } from '@mastra/core/storage';
@@ -15,7 +17,7 @@ import type { HookManager } from '../hooks/index.js';
 import type { McpManager } from '../mcp/index.js';
 import type { MastraCodeComposedState } from '../schema.js';
 import { MC_TOOLS } from '../tool-names.js';
-import { createWebSearchTool, createWebExtractTool, hasTavilyKey, requestSandboxAccessTool } from '../tools/index.js';
+import { createConfiguredWebTools, requestSandboxAccessTool } from '../tools/index.js';
 import { createWorkflowTool } from '../tools/workflows/create-workflow.js';
 import { deleteWorkflowTool } from '../tools/workflows/delete-workflow.js';
 import { getWorkflowTool } from '../tools/workflows/get-workflow.js';
@@ -27,6 +29,11 @@ import { WORKFLOW_MANAGEMENT_TOOL_IDS } from '../tools/workflows/tool-ids.js';
 export type ToolLike = {
   execute?: (...args: any[]) => Promise<unknown> | unknown;
 } & Record<string, any>;
+
+function configurePluginTool(tool: ToolLike, backgroundToolsEnabled: boolean): ToolLike {
+  if (backgroundToolsEnabled || !tool.background) return tool;
+  return { ...tool, background: { ...tool.background, enabled: false } };
+}
 
 export class LazyNotificationsStorage extends NotificationsStorage {
   constructor(private readonly storage: MastraCompositeStore) {
@@ -59,6 +66,10 @@ export class LazyNotificationsStorage extends NotificationsStorage {
 
   async updateNotification(input: UpdateNotificationInput) {
     return (await this.getNotificationsStorage()).updateNotification(input);
+  }
+
+  override async updateNotificationsStatus(input: UpdateNotificationsStatusInput) {
+    return (await this.getNotificationsStorage()).updateNotificationsStatus(input);
   }
 
   async dangerouslyClearAll() {
@@ -118,12 +129,13 @@ export function createDynamicTools(
   disabledTools?: string[],
   storage?: MastraCompositeStore,
   pluginTools?: Record<string, ToolLike>,
+  backgroundToolsEnabled = false,
 ) {
   return function getDynamicTools({
     requestContext,
   }: {
     requestContext: RequestContext;
-  }): Record<string, ToolLike> | Promise<Record<string, ToolLike>> {
+  }): ToolsInput | Promise<ToolsInput> {
     const ctx = requestContext.get('controller') as AgentControllerRequestContext<MastraCodeComposedState> | undefined;
     const state = ctx?.getState();
 
@@ -152,9 +164,9 @@ export function createDynamicTools(
       });
     }
 
-    if (hasTavilyKey()) {
-      tools.web_search = createWebSearchTool();
-      tools.web_extract = createWebExtractTool();
+    const configuredWebTools = createConfiguredWebTools();
+    if (configuredWebTools) {
+      Object.assign(tools, configuredWebTools);
     } else if (isAnthropicModel) {
       const anthropic = createAnthropic({});
       tools.web_search = anthropic.tools.webSearch_20250305();
@@ -180,7 +192,7 @@ export function createDynamicTools(
       if (pluginTools) {
         for (const [name, tool] of Object.entries(pluginTools)) {
           if (!(name in tools)) {
-            tools[name] = tool;
+            tools[name] = configurePluginTool(tool, backgroundToolsEnabled);
           }
         }
       }
@@ -202,7 +214,7 @@ export function createDynamicTools(
         }
       }
 
-      return tools;
+      return tools as ToolsInput;
     };
 
     if (typeof extraTools === 'function') {

@@ -24,6 +24,7 @@ import { parseSqlIdentifier } from '@mastra/core/utils';
 import type { DbClient } from '../../client';
 import { PgDB, resolvePgConfig, generateTableSQL, generateIndexSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
+import { toPgJson } from '../../db/sanitize-json';
 import { resolveTargets, runPrune } from '../../retention';
 
 function getSchemaName(schema?: string) {
@@ -97,6 +98,7 @@ function rowToTrigger(row: Record<string, any>): ScheduleTrigger {
 export class SchedulesPG extends SchedulesStorage {
   #db: PgDB;
   #client: DbClient;
+  #readClient: DbClient;
   #schema: string;
   #skipDefaultIndexes?: boolean;
   #indexes?: CreateIndexOptions[];
@@ -116,9 +118,10 @@ export class SchedulesPG extends SchedulesStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
     this.#client = client;
-    this.#db = new PgDB({ client, schemaName, skipDefaultIndexes });
+    this.#readClient = readClient;
+    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     this.#indexes = indexes?.filter(idx => (SchedulesPG.MANAGED_TABLES as readonly string[]).includes(idx.table));
@@ -266,7 +269,7 @@ export class SchedulesPG extends SchedulesStorage {
   }
 
   async createSchedule(schedule: Schedule): Promise<Schedule> {
-    const existing = await this.getSchedule(schedule.id);
+    const existing = await this.#getSchedule(this.#client, schedule.id);
     if (existing) {
       throw new Error(`Schedule with id "${schedule.id}" already exists`);
     }
@@ -292,7 +295,15 @@ export class SchedulesPG extends SchedulesStorage {
   }
 
   async getSchedule(id: string): Promise<Schedule | null> {
-    const row = await this.#client.oneOrNone<Record<string, any>>(
+    return this.#getSchedule(this.#readClient, id);
+  }
+
+  /**
+   * Same lookup against an explicit client. Mutation paths pass the writer so a
+   * lagging read replica cannot yield stale or missing rows mid-update.
+   */
+  async #getSchedule(client: DbClient, id: string): Promise<Schedule | null> {
+    const row = await client.oneOrNone<Record<string, any>>(
       `SELECT * FROM ${this.#table(TABLE_SCHEDULES)} WHERE id = $1`,
       [id],
     );
@@ -330,7 +341,7 @@ export class SchedulesPG extends SchedulesStorage {
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-    const rows = await this.#client.manyOrNone<Record<string, any>>(
+    const rows = await this.#readClient.manyOrNone<Record<string, any>>(
       `SELECT * FROM ${this.#table(TABLE_SCHEDULES)} ${where} ORDER BY created_at ASC`,
       params,
     );
@@ -363,10 +374,10 @@ export class SchedulesPG extends SchedulesStorage {
     if ('status' in patch && patch.status !== undefined) push('status = ?', patch.status);
     if ('nextFireAt' in patch && patch.nextFireAt !== undefined) push('next_fire_at = ?', patch.nextFireAt);
     if ('target' in patch && patch.target !== undefined) {
-      push('target = ?::jsonb', JSON.stringify(patch.target));
+      push('target = ?::jsonb', toPgJson(patch.target));
     }
     if ('metadata' in patch) {
-      push('metadata = ?::jsonb', patch.metadata != null ? JSON.stringify(patch.metadata) : null);
+      push('metadata = ?::jsonb', patch.metadata != null ? toPgJson(patch.metadata) : null);
     }
     if ('ownerType' in patch) push('owner_type = ?', (patch.ownerType as string | undefined) ?? null);
     if ('ownerId' in patch) push('owner_id = ?', (patch.ownerId as string | undefined) ?? null);
@@ -375,7 +386,7 @@ export class SchedulesPG extends SchedulesStorage {
 
     if (setClauses.length === 1) {
       // Only updated_at — nothing meaningful to patch
-      const existing = await this.getSchedule(id);
+      const existing = await this.#getSchedule(this.#client, id);
       if (!existing) throw new Error(`Schedule ${id} not found`);
       return existing;
     }
@@ -386,7 +397,7 @@ export class SchedulesPG extends SchedulesStorage {
       params,
     );
 
-    const updated = await this.getSchedule(id);
+    const updated = await this.#getSchedule(this.#client, id);
     if (!updated) throw new Error(`Schedule ${id} not found`);
     return updated;
   }
@@ -453,7 +464,7 @@ export class SchedulesPG extends SchedulesStorage {
       limitClause = `LIMIT $${params.length}`;
     }
 
-    const rows = await this.#client.manyOrNone<Record<string, any>>(
+    const rows = await this.#readClient.manyOrNone<Record<string, any>>(
       `SELECT * FROM ${this.#table(TABLE_SCHEDULE_TRIGGERS)}
        WHERE ${conditions.join(' AND ')}
        ORDER BY actual_fire_at DESC

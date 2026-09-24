@@ -4,6 +4,7 @@ import type {
   ChannelHandler,
   ChannelHandlerContext,
   ChannelHandlers,
+  ChannelSessionResolve,
   ChannelSessionStart,
   ResolveResourceId,
   ResolveThreadId,
@@ -14,21 +15,32 @@ import type { SlackAdapterChannelConfig } from '@mastra/slack';
 import { Card, CardText, Actions, LinkButton } from 'chat';
 
 import {
+  createSourceControlSessionLookup,
   hydrateFactorySession,
   resolveFactoryDefaultModelId,
   resolveFactoryProjectForSession,
+  resolveFactorySourceControl,
   resolveFactorySourceRepository,
 } from '../../session/factory-session.js';
+import { applyPersonalMemorySettings } from '../../session/memory-settings-hydration.js';
+import { readRequestContextOrgId, seedSessionOrg } from '../../session/org-seed.js';
 import type {
   ChannelAccountLink,
   ChannelAccountLinkKey,
   ChannelIdentityStorage,
 } from '../../storage/domains/channel-identity/base.js';
+import type { FactoryActorExternalIdentity } from '../../storage/domains/comments/actor.js';
+import { actorFromChannelAuthor } from '../../storage/domains/comments/actor.js';
+import type { CommentsDomain } from '../../storage/domains/comments/domain.js';
 import type { MemorySettingsStorage } from '../../storage/domains/memory-settings/base.js';
+import type { ModelPacksStorage } from '../../storage/domains/model-packs/base.js';
 import type { FactoryProjectsStorage } from '../../storage/domains/projects/base.js';
 import type { SourceControlStorageHandle } from '../../storage/domains/source-control/base.js';
-import type { WorkItemsStorage } from '../../storage/domains/work-items/base.js';
+import type { ExternalWorkItemSource, WorkItemRow, WorkItemsStorage } from '../../storage/domains/work-items/base.js';
 import type { FactoryChannelsConfig } from '../base.js';
+
+import { resolveEmojiShortcodes } from './emoji.js';
+import { slackCommentSource } from './feed-publisher.js';
 
 // Derive the thread/message types from the core handler signature rather than
 // importing them from `chat` directly: mc-web can resolve a different `chat`
@@ -37,6 +49,22 @@ import type { FactoryChannelsConfig } from '../base.js';
 // keeps everything on one version.
 type HandlerThread = Parameters<ChannelHandler>[0];
 type HandlerMessage = Parameters<ChannelHandler>[1];
+
+const SLACK_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_WORK_ITEM_TITLE_CHARS = 80;
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/**
+ * A card is titled with what the sender wrote. Cutting counts graphemes, not
+ * code points: `👍🏼` is a base plus a skin-tone modifier, and a cut between
+ * them leaves the wrong emoji.
+ */
+function workItemTitleFrom(messageText: string): string {
+  const resolved = resolveEmojiShortcodes(messageText);
+  const characters = [...graphemes.segment(resolved)].map(({ segment }) => segment);
+  if (characters.length <= MAX_WORK_ITEM_TITLE_CHARS) return resolved;
+  return `${characters.slice(0, MAX_WORK_ITEM_TITLE_CHARS - 1).join('')}…`;
+}
 
 /** Dependencies the Slack channel handlers close over, injected from the web entry. */
 interface SlackChannelDeps {
@@ -69,11 +97,23 @@ interface SlackChannelDeps {
    * registered) → chat-only sessions as before.
    */
   sourceControl?: SourceControlStorageHandle;
+  /** Registered source-control partitions used to select the provider linked to each Factory project. */
+  sourceControls?: readonly SourceControlStorageHandle[];
   /**
    * Observational-memory settings domain. When provided, a repo-backed session
-   * adopts its owner's memory settings on start, matching the web kickoff.
+   * adopts its factory project's shared memory settings on start, matching the
+   * web kickoff — and the linked sender's own settings win over them for every
+   * knob the sender has saved.
    */
   memorySettings?: MemorySettingsStorage;
+  /**
+   * Model-packs domain. When provided, a new repo-backed session starts on the
+   * linked sender's active pack build model — the model that user picked for
+   * themselves — before the factory's shared default. Read once, when the
+   * thread's build model is first chosen; the choice is persisted on the thread
+   * and never re-resolved. Unset → the factory default, as before.
+   */
+  modelPacks?: ModelPacksStorage;
   /**
    * Factory work-items domain. When provided, a dispatched new-session thread
    * (DM or mention) upserts a Work-board card in Building (`execute`) carrying
@@ -81,8 +121,17 @@ interface SlackChannelDeps {
    * session. Best-effort — a failure never blocks the run. Unset → no card.
    */
   workItems?: WorkItemsStorage;
+  /**
+   * Work-item feed. With it (and `workItems`), an `aside` lands as a comment on
+   * the card the thread created. Unset → asides stay ignored, as before.
+   */
+  feed?: Pick<CommentsDomain, 'createComment'>;
   /** Overrides applied to the Slack channel adapter entry. */
   adapterOptions?: SlackAdapterChannelConfig;
+}
+
+function configuredSourceControls(deps: SlackChannelDeps): readonly SourceControlStorageHandle[] {
+  return deps.sourceControls ?? (deps.sourceControl ? [deps.sourceControl] : []);
 }
 
 /**
@@ -300,7 +349,8 @@ function threadBranch(threadId: string): string {
  * gate's job; this hook must never post.
  */
 export function createChannelResourceIdResolver(deps: SlackChannelDeps): ResolveResourceId {
-  const { accountLinks, projects, sourceControl } = deps;
+  const { accountLinks, projects } = deps;
+  const sourceControls = configuredSourceControls(deps);
   return async ({ platform, thread, message }) => {
     // NOT the hook's `defaultResourceId`: configuring a custom resolver
     // bypasses AgentControllerChannels' own `channel:{thread.id}` derivation
@@ -308,7 +358,7 @@ export function createChannelResourceIdResolver(deps: SlackChannelDeps): Resolve
     // default is the per-USER memory key. Chat-only fallbacks must stay
     // per-thread, so reproduce the controller default here.
     const chatOnlyResourceId = `channel:${thread.id}`;
-    if (!accountLinks || !projects || !sourceControl) return chatOnlyResourceId;
+    if (!accountLinks || !projects || sourceControls.length === 0) return chatOnlyResourceId;
     try {
       const externalTeamId = rawTeamId(message.raw);
       if (!externalTeamId) return chatOnlyResourceId;
@@ -332,6 +382,8 @@ export function createChannelResourceIdResolver(deps: SlackChannelDeps): Resolve
       }
       if (!factoryProjectId) return chatOnlyResourceId;
 
+      const sourceControl = await resolveFactorySourceControl({ sourceControls, orgId, factoryProjectId });
+      if (!sourceControl) return chatOnlyResourceId;
       const repo = await resolveFactorySourceRepository({ sourceControl, orgId, factoryProjectId });
       if (!repo.found) return chatOnlyResourceId;
 
@@ -375,6 +427,26 @@ export function createChannelResourceIdResolver(deps: SlackChannelDeps): Resolve
 export const resolveChannelThreadId: ResolveThreadId = ({ resourceId, defaultThreadId }) =>
   resourceId.startsWith('channel:') ? defaultThreadId : resourceId;
 
+/** Create channel sessions with their Factory ownership present in initial controller state. */
+export function createChannelSessionResolver(deps: SlackChannelDeps): ChannelSessionResolve {
+  const sourceControlSessions = createSourceControlSessionLookup(configuredSourceControls(deps));
+  return async ({ controller, thread, requestContext }) => {
+    const sourceControl = thread.resourceId.startsWith('channel:')
+      ? null
+      : await sourceControlSessions.getSourceControlBySessionId(thread.resourceId);
+    const owner = sourceControl
+      ? await resolveFactoryProjectForSession({ sourceControl, sessionId: thread.resourceId })
+      : null;
+    return controller.createSession({
+      id: thread.resourceId,
+      ownerId: controller.id,
+      resourceId: thread.resourceId,
+      requestContext,
+      ...(owner ? { tags: { factoryProjectId: owner.factoryProjectId } } : {}),
+    });
+  };
+}
+
 /**
  * Apply the factory's configuration to a Slack-created session the first time
  * its thread reaches the controller.
@@ -388,31 +460,145 @@ export const resolveChannelThreadId: ResolveThreadId = ({ resourceId, defaultThr
  * session id, which the source-control rows turn back into a project — a
  * chat-only `channel:...` id names no project, so there is nothing to read.
  *
- * Skips a session whose mode already has a model persisted on the thread. That
- * is the durable record of a deliberate choice — either an earlier start or a
- * user's own switch — and re-applying the factory default over it would undo
- * the user's selection every time the process restarts.
+ * The model this session starts on is picked here, once, in the order of who
+ * chose it: the linked sender's active model pack, else the factory project's
+ * default, else the SDK's built-in mode default. The choice is persisted on the
+ * thread as `modeModelId_<mode>`, so it outlives the process that made it.
+ *
+ * Observational memory is configured here too, in the same order of who chose
+ * it: the project's shared settings first, then the linked sender's own row,
+ * which wins for every knob they have saved. The pair is re-applied on every
+ * start rather than once — memory settings are stored preference, not a choice
+ * made on this thread, and a restarted process re-resolves the project's row
+ * before this hook runs.
+ *
+ * The model resolution is skipped on a session whose mode already has a model
+ * persisted on the thread. That is the durable record of a deliberate choice —
+ * either an earlier start or a user's own switch — and re-applying a preference
+ * over it would undo the user's selection every time the process restarts.
+ * Memory settings have no such per-thread record, so they are re-applied on
+ * every start.
  */
 export function createChannelSessionStartHook(deps: SlackChannelDeps): ChannelSessionStart {
-  const { projects, sourceControl, memorySettings } = deps;
-  return async ({ session, thread }) => {
-    if (!projects || !sourceControl) return;
+  const { projects, memorySettings, modelPacks } = deps;
+  const sourceControlSessions = createSourceControlSessionLookup(configuredSourceControls(deps));
+  return async ({ session, thread, requestContext }) => {
+    // Seed the tenant org above every guard below. `gateDispatch` stamps it on
+    // the message's request context before the session exists, so this needs no
+    // storage read — which matters, because the model lookups below deliberately
+    // skip storage on a restarted session. A channel-only thread and a thread
+    // whose dispatch was ungated both land here with no org and are marked
+    // unresolved rather than being left to look like a local session.
+    await seedSessionOrg(session, readRequestContextOrgId(requestContext));
+
+    if (!projects) return;
     if (thread.resourceId.startsWith('channel:')) return;
 
-    const modeModelKey = `modeModelId_${session.mode.get()}`;
-    if (await session.thread.getSetting({ key: modeModelKey })) return;
-
+    const sourceControl = await sourceControlSessions.getSourceControlBySessionId(thread.resourceId);
+    if (!sourceControl) return;
     const owner = await resolveFactoryProjectForSession({ sourceControl, sessionId: thread.resourceId });
     if (!owner) return;
 
-    const defaultModelId = await resolveFactoryDefaultModelId(projects, owner.factoryProjectId);
-    await hydrateFactorySession(session, {
+    // Repo-backed Slack sessions are factory sessions: stamp the owning
+    // project onto controller state so downstream reads (org-first credential
+    // resolution, authority gates) recognize them, same as board runs.
+    await session.state.set({ factoryProjectId: owner.factoryProjectId });
+    // Route the org through the seed helper rather than stamping it directly:
+    // an ungated dispatch marked this session unresolved above, and owner
+    // recovery is the resolution that has to clear that marker with it.
+    await seedSessionOrg(session, owner.orgId);
+
+    const modeModelKey = `modeModelId_${session.mode.get()}`;
+    if (!(await session.thread.getSetting({ key: modeModelKey }))) {
+      const factoryModelId = await resolveFactoryDefaultModelId(projects, owner.factoryProjectId);
+      const userModelId = await resolveActivePackBuildModel(modelPacks, owner);
+
+      await hydrateFactorySession(session, {
+        orgId: owner.orgId,
+        factoryProjectId: owner.factoryProjectId,
+        // The FACTORY model drives observational-memory's provider-aware
+        // fallback, even when the sender's pack supplies the model the session
+        // actually runs — a factory connected only to Anthropic should not
+        // observe with an uncredentialed provider.
+        defaultModelId: factoryModelId,
+        memorySettings,
+      });
+
+      const selectedModelId = userModelId ?? factoryModelId;
+      if (selectedModelId && selectedModelId !== factoryModelId) {
+        // The sender's own choice beats the factory's. `switch` applies the model
+        // and persists it as this mode's model on the thread in one step — which
+        // is what makes the choice outlive this process. A switch that fails is
+        // logged by the channel machinery and leaves the factory/SDK model that
+        // `hydrateFactorySession` already applied: the message still answers.
+        try {
+          await session.model.switch({ modelId: selectedModelId });
+        } catch (error) {
+          console.warn("[slack] Failed to apply the sender's model pack model", {
+            modelId: selectedModelId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          const currentModelId = session.model.get();
+          if (currentModelId && !factoryModelId) {
+            try {
+              await session.model.saveForMode({ modeId: session.mode.get(), modelId: currentModelId });
+            } catch (saveError) {
+              console.warn("[slack] Failed to persist the sender's model pack model", {
+                modelId: currentModelId,
+                error: saveError instanceof Error ? saveError.message : String(saveError),
+              });
+            }
+          }
+        }
+      } else if (!selectedModelId) {
+        // Neither preference exists, so the SDK's built-in mode default is this
+        // thread's model of record. Pin it too: a later SDK upgrade that moves
+        // that default must not silently retarget a thread that already started.
+        const currentModelId = session.model.get();
+        if (currentModelId) {
+          await session.model.saveForMode({ modeId: session.mode.get(), modelId: currentModelId });
+        }
+      }
+    }
+
+    // The sender's own observational-memory settings, applied last so they beat
+    // the project's — and on EVERY start, not just the first. Unlike the model,
+    // this is stored preference rather than a choice made on this thread: a
+    // restarted process re-resolves the project row before this hook runs, so
+    // skipping it here would quietly put a thread back on the project's OM
+    // configuration. Chat-only threads never reach this point.
+    await applyPersonalMemorySettings(session, {
+      memorySettings,
       orgId: owner.orgId,
       userId: owner.userId,
-      defaultModelId,
-      memorySettings,
     });
   };
+}
+
+/**
+ * The `build` model of the sender's active model pack — the model that user
+ * chose for themselves — or `undefined` when they have no pack.
+ *
+ * Best-effort by design: an uninitialized model-packs domain, a read failure, or
+ * a pack saved without a build model all mean "no personal preference", which
+ * falls through to the factory default rather than failing the dispatch.
+ */
+async function resolveActivePackBuildModel(
+  modelPacks: ModelPacksStorage | undefined,
+  owner: { orgId: string; userId: string },
+): Promise<string | undefined> {
+  if (!modelPacks) return undefined;
+  try {
+    const active = await modelPacks.getActive({ orgId: owner.orgId, userId: owner.userId });
+    return active?.models.build || undefined;
+  } catch (error) {
+    console.warn('[slack] model pack lookup failed for a new session', {
+      orgId: owner.orgId,
+      userId: owner.userId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
 }
 
 /**
@@ -483,6 +669,31 @@ async function gateDispatch(
 }
 
 /**
+ * A channel id and a `ts` name a thread only inside the workspace that issued
+ * them, so the team scopes the card's key — without it two workspaces could
+ * hold one key and an aside would land on another tenant's card.
+ */
+export function slackThreadSource(thread: HandlerThread, teamId?: string): ExternalWorkItemSource {
+  return {
+    integrationId: thread.adapter.name,
+    type: 'slack-thread',
+    ...(teamId ? { workspaceId: teamId } : {}),
+    externalId: thread.id,
+  };
+}
+
+/** Cards written before the key carried a team are still keyed bare. */
+async function findThreadWorkItem(
+  workItems: WorkItemsStorage,
+  thread: HandlerThread,
+  teamId?: string,
+): Promise<WorkItemRow | null> {
+  const scoped = await workItems.getBySource(slackThreadSource(thread, teamId));
+  if (scoped || !teamId) return scoped;
+  return workItems.getBySource(slackThreadSource(thread));
+}
+
+/**
  * Upsert the Work-board card for a dispatched Slack-thread run. Keyed on the
  * thread via `externalSource` — the work-items domain's unique
  * `(factory_project_id, source_key)` index makes repeat messages reuse the
@@ -519,7 +730,7 @@ export async function upsertThreadWorkItem({
   url?: string;
 }): Promise<void> {
   try {
-    const title = message.text.length > 80 ? `${message.text.slice(0, 79)}…` : message.text;
+    const title = workItemTitleFrom(message.text);
 
     await workItems.upsert({
       orgId: link.orgId ?? '',
@@ -528,15 +739,7 @@ export async function upsertThreadWorkItem({
       reuseMode: 'preserve',
       input: {
         title: title || 'Slack thread',
-        // `integrationId` is the platform ('slack'); `type` is a single
-        // constant (no DM/mention distinction); `externalId` is the stable
-        // platform thread id — together they form the idempotency key.
-        externalSource: {
-          integrationId: thread.adapter.name,
-          type: 'slack-thread',
-          externalId: thread.id,
-          ...(url ? { url } : {}),
-        },
+        externalSource: { ...slackThreadSource(thread, slackTeamId(message)), ...(url ? { url } : {}) },
         stages: ['execute'],
         ...(session ? { sessions: { chat: session } } : {}),
       },
@@ -642,6 +845,61 @@ function createNewSessionChatHandler(deps: SlackChannelDeps): ChannelHandler {
     );
   };
 }
+
+/**
+ * An `aside` never reaches the agent, but it is still part of the conversation:
+ * record it on the card the thread created. The link is resolved here rather
+ * than through `gateDispatch`, which posts a Connect card an aside must not
+ * trigger. Best-effort — nothing here may surface in the Slack thread.
+ */
+async function ingestAside(
+  thread: HandlerThread,
+  message: HandlerMessage,
+  { feed, workItems, accountLinks }: SlackChannelDeps,
+): Promise<void> {
+  if (!feed || !workItems) return;
+  const body = resolveEmojiShortcodes(message.text.replace(/^aside\b[,:]?\s*/i, '').trim());
+  if (!body) return;
+  try {
+    const teamId = slackTeamId(message);
+    const workItem = await findThreadWorkItem(workItems, thread, teamId);
+    if (!workItem) return;
+
+    const external: FactoryActorExternalIdentity = {
+      platform: thread.adapter.name,
+      ...(teamId ? { teamId } : {}),
+      messageId: message.id,
+      userId: message.author.userId,
+      userName: message.author.userName,
+      fullName: message.author.fullName,
+      isBot: message.author.isBot,
+    };
+    const link =
+      accountLinks && teamId
+        ? await accountLinks.getAccountLink({
+            platform: external.platform,
+            externalTeamId: teamId,
+            externalUserId: external.userId,
+          })
+        : null;
+
+    const result = await feed.createComment({
+      orgId: workItem.orgId,
+      workItemId: workItem.id,
+      author: actorFromChannelAuthor(external, link),
+      body,
+      occurredAt: message.metadata.dateSent,
+      externalSource: slackCommentSource(thread.id, message.id, teamId),
+    });
+    if (result.status !== 'created') {
+      console.warn('[slack] aside not ingested', { thread: thread.id, messageTs: message.id, status: result.status });
+    }
+  } catch (error) {
+    // Slack was acked before this handler ran, so a lost aside is never redelivered.
+    console.warn('[slack] aside ingest failed', { thread: thread.id, messageTs: message.id, error });
+  }
+}
+
 export const createHandlers = (deps: SlackChannelDeps): ChannelHandlers => {
   const newSessionChatHandler = createNewSessionChatHandler(deps);
 
@@ -650,7 +908,7 @@ export const createHandlers = (deps: SlackChannelDeps): ChannelHandlers => {
       // `aside` as its own leading word lets humans talk in a subscribed
       // thread without the bot replying. Word boundary so messages that
       // merely start with "aside..." (e.g. "asides can wait") still route.
-      if (/^aside\b/i.test(message.text)) return;
+      if (/^aside\b/i.test(message.text)) return ingestAside(thread, message, deps);
       // A subscribed follow-up from an unlinked sender must not run either
       // (e.g. the link was removed mid-conversation), and it must still
       // resolve a factory (e.g. the default was cleared or its factory
@@ -673,7 +931,9 @@ interface SlackCredentials {
 }
 
 export function createSlackChannelsConfig(deps: SlackChannelDeps & { slack: SlackCredentials }): FactoryChannelsConfig {
-  const adapter = createSlackAdapter(deps.slack);
+  // Per HTTP attempt, not per call: the WebClient's own retry policy still
+  // waits out a 429. Without it a dead socket hangs a post forever.
+  const adapter = createSlackAdapter({ ...deps.slack, webClientOptions: { timeout: SLACK_REQUEST_TIMEOUT_MS } });
   const slack =
     deps.adapterOptions?.streaming === false
       ? { adapter, ...deps.adapterOptions }
@@ -686,6 +946,7 @@ export function createSlackChannelsConfig(deps: SlackChannelDeps & { slack: Slac
     // resourceId, which is what makes the controller session repo-backed.
     resolveResourceId: createChannelResourceIdResolver(deps),
     resolveThreadId: resolveChannelThreadId,
+    resolveSession: createChannelSessionResolver(deps),
     // Those sessions are created by the channel machinery, not the web kickoff,
     // so this is where they pick up the factory's configuration.
     onSessionStart: createChannelSessionStartHook(deps),

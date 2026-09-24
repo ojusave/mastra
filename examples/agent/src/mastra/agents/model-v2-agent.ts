@@ -13,6 +13,7 @@ import {
 import { stepLoggerProcessor, responseQualityProcessor } from '../processors';
 import { findUserWorkflow } from '../workflows/other';
 import { createScorer } from '@mastra/core/evals';
+import { alternatingScorer, alwaysPassScorer } from '../scorers/chef-model-v2-scorers';
 import { cryptoResearchTool, cryptoPriceTool } from '../tools';
 import { weatherTool as weatherInfo } from '../tools/weather-tool';
 import {
@@ -86,6 +87,16 @@ export const chefModelV2Agent = new Agent({
   id: 'chef-model-v2-agent',
   name: 'Chef Agent V2 Model',
   description: 'A chef agent that can help you cook great meals with whatever ingredients you have available.',
+  metadata: {
+    suggestedPrompts: [
+      'I have eggs, spinach and feta — what can I cook tonight?',
+      'Plan a 3-course dinner for four with a 45-minute budget',
+      "What's the weather like, and suggest a matching comfort meal",
+      'Give me a vegan substitute for butter in a cake recipe',
+      'Help me meal-prep lunches for the week',
+      'Turn leftover rice into something interesting',
+    ],
+  },
   instructions: {
     content: `
       You are Michel, a practical and experienced home chef who helps people cook great meals with whatever
@@ -107,17 +118,10 @@ export const chefModelV2Agent = new Agent({
     lessComplexWorkflow,
     findUserWorkflow,
   },
-  // scorers: ({ mastra }) => {
-  //   if (!mastra) {
-  //     throw new Error('Mastra not found');
-  //   }
-
-  //   const scorer1 = mastra.getScorerById('scorer1');
-
-  //   return {
-  //     scorer1: { scorer: scorer1, sampling: { rate: 1, type: 'ratio' } },
-  //   };
-  // },
+  scorers: {
+    alwaysPass: { scorer: alwaysPassScorer, sampling: { rate: 1, type: 'ratio' } },
+    alternating: { scorer: alternatingScorer, sampling: { rate: 1, type: 'ratio' } },
+  },
   memory,
   signals: [new TaskSignalProvider()],
   inputProcessors: [moderationProcessor],

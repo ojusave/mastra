@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   BookOpen,
   Bot,
+  Brain,
   Building2,
   Cable,
   CircleUserRound,
@@ -31,6 +32,7 @@ type SettingsNavItem = {
 type SettingsNavGroup = {
   id: string;
   label?: string;
+  ariaLabel?: string;
   items: SettingsNavItem[];
 };
 
@@ -50,11 +52,36 @@ const SETTINGS_GROUPS: SettingsNavGroup[] = [
         icon: Palette,
         searchText: 'preferences general theme appearance color scheme completion sound',
       },
+    ],
+  },
+  {
+    id: 'agent',
+    label: 'Agent',
+    items: [
       {
-        id: 'factory',
-        label: SETTINGS_SECTION_LABELS.factory,
-        icon: Building2,
-        searchText: 'factory project organization remove delete danger',
+        id: 'models',
+        label: SETTINGS_SECTION_LABELS.models,
+        icon: Bot,
+        searchText:
+          'models thinking level factory default model packs api keys providers credentials sign in oauth custom endpoints',
+      },
+      {
+        id: 'memory',
+        label: SETTINGS_SECTION_LABELS.memory,
+        icon: Brain,
+        searchText: 'memory observational recall observer reflector thresholds attachments summarize context',
+      },
+      {
+        id: 'skills',
+        label: SETTINGS_SECTION_LABELS.skills,
+        icon: BookOpen,
+        searchText: 'skills factory triage plan review agent instructions prompts stages',
+      },
+      {
+        id: 'behavior',
+        label: SETTINGS_SECTION_LABELS.behavior,
+        icon: SlidersHorizontal,
+        searchText: 'behavior auto approve tools smart editing notifications permissions read edit execute mcp',
       },
     ],
   },
@@ -66,7 +93,7 @@ const SETTINGS_GROUPS: SettingsNavGroup[] = [
         id: 'repositories',
         label: SETTINGS_SECTION_LABELS.repositories,
         icon: GitBranch,
-        searchText: 'repositories source control git branches remotes code worktrees setup github',
+        searchText: 'repositories source control git branches remotes code worktrees sandbox setup github',
       },
       {
         id: 'intake',
@@ -83,27 +110,14 @@ const SETTINGS_GROUPS: SettingsNavGroup[] = [
     ],
   },
   {
-    id: 'agent',
-    label: 'Agent',
+    id: 'factory',
+    ariaLabel: SETTINGS_SECTION_LABELS.factory,
     items: [
       {
-        id: 'models',
-        label: SETTINGS_SECTION_LABELS.models,
-        icon: Bot,
-        searchText:
-          'models thinking level factory default model packs api keys providers credentials sign in oauth custom endpoints memory observational recall',
-      },
-      {
-        id: 'skills',
-        label: SETTINGS_SECTION_LABELS.skills,
-        icon: BookOpen,
-        searchText: 'skills factory triage plan review agent instructions prompts stages',
-      },
-      {
-        id: 'behavior',
-        label: SETTINGS_SECTION_LABELS.behavior,
-        icon: SlidersHorizontal,
-        searchText: 'behavior auto approve tools smart editing notifications permissions read edit execute mcp',
+        id: 'factory',
+        label: SETTINGS_SECTION_LABELS.factory,
+        icon: Building2,
+        searchText: 'factory project organization manage remove delete danger',
       },
     ],
   },
@@ -127,7 +141,7 @@ export function SettingsNavigation() {
   return (
     <>
       <MainSidebar.NavList>
-        <MainSidebar.NavLink asChild size="default" link={{ name: 'Back to app', url: '#', icon: <ArrowLeft /> }}>
+        <MainSidebar.NavLink asChild link={{ name: 'Back to app', url: '#', icon: <ArrowLeft /> }}>
           <button type="button" aria-label="Back to app" onClick={closeSettings}>
             <ArrowLeft aria-hidden="true" />
             <MainSidebar.NavLabel>Back to app</MainSidebar.NavLabel>
@@ -136,7 +150,7 @@ export function SettingsNavigation() {
       </MainSidebar.NavList>
       {state === 'default' && (
         <div className="py-2">
-          <InputGroup variant="outline">
+          <InputGroup>
             <InputGroupAddon>
               <Search aria-hidden="true" />
             </InputGroupAddon>
@@ -157,7 +171,7 @@ export function SettingsNavigation() {
             <MainSidebar.NavSection
               key={group.id}
               aria-labelledby={headerId}
-              aria-label={headerId ? undefined : group.id}
+              aria-label={headerId ? undefined : (group.ariaLabel ?? group.id)}
             >
               {group.label && <MainSidebar.NavHeader id={headerId}>{group.label}</MainSidebar.NavHeader>}
               <MainSidebar.NavList>
@@ -167,7 +181,6 @@ export function SettingsNavigation() {
                     <MainSidebar.NavLink
                       key={id}
                       asChild
-                      size="default"
                       isActive={isActive}
                       link={{ name: label, url: '#', icon: <Icon /> }}
                     >
@@ -188,7 +201,7 @@ export function SettingsNavigation() {
           );
         })
       ) : (
-        <Txt as="p" variant="ui-sm" role="status" className="px-3 py-2">
+        <Txt as="p" variant="caption" role="status" className="px-3 py-2">
           No settings found.
         </Txt>
       )}

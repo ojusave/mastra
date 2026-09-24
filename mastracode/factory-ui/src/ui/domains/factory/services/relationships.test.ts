@@ -2,8 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   inferredParentWorkItemId,
-  pullRequestCandidateIndex,
-  relatedWorkItems,
+  relatedWorkItemIndex,
   relationshipLabel,
   workItemReferenceLabel,
 } from './relationships';
@@ -25,8 +24,12 @@ function workItem(overrides: Partial<WorkItem> & Pick<WorkItem, 'id' | 'source'>
     stageHistory: [],
     sessions: {},
     metadata: {},
+    triageType: null,
+    acceptedAt: null,
     createdAt: '2026-07-17T00:00:00.000Z',
     updatedAt: '2026-07-17T00:00:00.000Z',
+    commentCount: 0,
+    feedActivityAt: null,
     ...rest,
     revision: rest.revision ?? 1,
   };
@@ -52,9 +55,29 @@ describe('Factory work item relationships', () => {
       metadata: { headBranch: 'factory/issue-24', number: 25 },
     });
 
-    expect(relatedWorkItems(review, [review, issue])).toEqual([issue]);
-    expect(relatedWorkItems(issue, [review, issue])).toEqual([review]);
+    expect(relatedWorkItemIndex([review, issue])(review)).toEqual([issue]);
+    expect(relatedWorkItemIndex([review, issue])(issue)).toEqual([review]);
     expect(inferredParentWorkItemId(review.metadata, [review, issue])).toBe(issue.id);
+  });
+
+  it('links a GitLab MR back to its issue session and names it as a Review item', () => {
+    const issue = workItem({
+      id: 'gitlab-issue-1',
+      source: 'gitlab-issue',
+      sessions: {
+        work: { sessionId: 'session-1', branch: 'feature/gitlab', threadId: 'thread-1', startedBy: 'user-1' },
+      },
+    });
+    const review = workItem({
+      id: 'gitlab-mr-5',
+      source: 'gitlab-pr',
+      metadata: { headBranch: 'feature/gitlab', gitlabMergeRequestIid: 5 },
+    });
+    expect(relatedWorkItemIndex([review, issue])(review)).toEqual([issue]);
+    expect(relatedWorkItemIndex([review, issue])(issue)).toEqual([review]);
+    expect(inferredParentWorkItemId(review.metadata, [review, issue])).toBe(issue.id);
+    expect(relationshipLabel(review)).toBe('Review: MR !5');
+    expect(workItemReferenceLabel(review)).toBe('MR !5');
   });
 
   it('given a review with an explicit parent, when another work item shares its branch, then branch inference does not add a second parent', () => {
@@ -78,8 +101,8 @@ describe('Factory work item relationships', () => {
       metadata: { headBranch: 'factory/shared', number: 26 },
     });
 
-    expect(relatedWorkItems(review, [review, explicitParent, sameBranch])).toEqual([explicitParent]);
-    expect(relatedWorkItems(sameBranch, [review, explicitParent, sameBranch])).toEqual([]);
+    expect(relatedWorkItemIndex([review, explicitParent, sameBranch])(review)).toEqual([explicitParent]);
+    expect(relatedWorkItemIndex([review, explicitParent, sameBranch])(sameBranch)).toEqual([]);
   });
 
   it('given an unrelated PR branch, when relationships resolve, then it remains unrelated', () => {
@@ -101,7 +124,7 @@ describe('Factory work item relationships', () => {
       metadata: { headBranch: 'feature/unrelated', number: 25 },
     });
 
-    expect(relatedWorkItems(review, [review, issue])).toEqual([]);
+    expect(relatedWorkItemIndex([review, issue])(review)).toEqual([]);
     expect(inferredParentWorkItemId(review.metadata, [review, issue])).toBeUndefined();
   });
 
@@ -131,8 +154,8 @@ describe('Factory work item relationships', () => {
   });
 });
 
-describe('pull request candidate index', () => {
-  it('given every way a card links to a PR, when narrowing candidates, then it agrees with a full board scan', () => {
+describe('related work item index', () => {
+  it('given every way a card links to another, when resolving one board, then each card gets its links in board order', () => {
     const orphanBranch = workItem({
       id: 'issue-90',
       source: 'github-issue',
@@ -169,12 +192,13 @@ describe('pull request candidate index', () => {
       multiLinked,
       childOfMultiLinked,
     ];
-    const candidatesFor = pullRequestCandidateIndex(board);
+    const relatedItemsFor = relatedWorkItemIndex(board);
 
-    for (const item of board.filter(candidate => candidate.source !== 'github-pr')) {
-      expect(relatedWorkItems(item, candidatesFor(item))).toEqual(
-        relatedWorkItems(item, board).filter(related => related.source === 'github-pr'),
-      );
-    }
+    expect(relatedItemsFor(orphanBranch)).toEqual([byBranch]);
+    expect(relatedItemsFor(byChild)).toEqual([childPr]);
+    expect(relatedItemsFor(parentPr)).toEqual([byParent]);
+    expect(relatedItemsFor(unrelated)).toEqual([]);
+    // Board order decides, not the order the buckets are read in.
+    expect(relatedItemsFor(multiLinked)).toEqual([branchPr, childOfMultiLinked]);
   });
 });

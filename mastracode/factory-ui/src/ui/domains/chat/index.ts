@@ -1,4 +1,3 @@
-export { ChatHeader } from './components/ChatHeader';
 export { ChatOverlays } from './components/ChatOverlays';
 export { ComposerPanel } from './components/ComposerPanel';
 export { Composer } from './components/Composer';
@@ -6,7 +5,6 @@ export { GoalPanel } from './components/GoalPanel';
 export { ShortcutsOverlay } from './components/ShortcutsOverlay';
 export { StatusLine } from './components/StatusLine';
 export { Transcript } from './components/Transcript';
-export { SLASH_COMMANDS } from './services/commands';
 export { ChatSessionProvider } from './context/ChatSessionProvider';
 export { ChatConnectionProvider } from './context/ChatConnectionProvider';
 export { ChatTranscriptProvider } from './context/ChatTranscriptProvider';

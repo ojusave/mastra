@@ -6,7 +6,7 @@ import { cn } from '@mastra/playground-ui/utils/cn';
 import { Check, ChevronsUpDown, Factory as FactoryIcon, Plus } from 'lucide-react';
 import { useLocation, useNavigate, useParams } from 'react-router';
 import { useFactoriesQuery, useFactoryQuery } from '../../../../hooks/useFactories';
-import { factorySwitchPath } from '../services/factoryPaths';
+import { createFactoryPath, factorySwitchPath } from '../services/factoryPaths';
 
 /** Inline factory selection with a single Create Factory action. */
 export function FactorySwitcher() {
@@ -19,8 +19,10 @@ export function FactorySwitcher() {
   const navigate = useNavigate();
   const { setOpenMobile } = useMainSidebar();
 
-  const openFactories = () => {
-    void navigate('/factories/create');
+  const createFactoryFrom = factoryId ?? factories[0]?.id;
+  const openCreateFactory = () => {
+    if (!createFactoryFrom) return;
+    void navigate(createFactoryPath(createFactoryFrom));
     setOpenMobile(false);
   };
 
@@ -35,11 +37,11 @@ export function FactorySwitcher() {
           'mt-1 w-full justify-start gap-2 px-2.5 text-left [&>svg]:mx-0',
         )}
       >
-        <FactoryIcon size={16} className="text-icon3 shrink-0" />
-        <Txt as="span" variant="ui-sm" className="text-icon6 min-w-0 flex-1 truncate">
+        <FactoryIcon size={16} className="text-muted-foreground shrink-0" />
+        <Txt as="span" variant="caption" className="text-foreground min-w-0 flex-1 truncate">
           {activeFactory?.name ?? 'Select a factory…'}
         </Txt>
-        <ChevronsUpDown size={13} className="text-icon3 shrink-0" />
+        <ChevronsUpDown size={13} className="text-muted-foreground shrink-0" />
       </DropdownMenu.Trigger>
       <DropdownMenu.Content align="start" className="w-64">
         {factories.map(factory => (
@@ -58,7 +60,7 @@ export function FactorySwitcher() {
         ))}
 
         {factories.length > 0 && <DropdownMenu.Separator />}
-        <DropdownMenu.Item onSelect={openFactories}>
+        <DropdownMenu.Item disabled={!createFactoryFrom} onSelect={openCreateFactory}>
           <Plus />
           <span>Create Factory</span>
         </DropdownMenu.Item>

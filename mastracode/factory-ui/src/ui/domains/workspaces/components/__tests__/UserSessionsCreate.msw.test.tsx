@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { server } from '../../../../../../e2e/ui/msw-server';
 import { TEST_BASE_URL, renderWithProviders, waitForMutationsIdle } from '../../../../../../e2e/ui/render';
 import { queryKeys } from '../../../../../api/keys';
-import type { FactoryUserSession } from '../../services/github';
+import type { FactoryUserSession } from '../../services/user-sessions';
 import { UserSessionsSection } from '../UserSessionsSection';
 
 const projectRepositoryId = 'ghp-1';
@@ -56,7 +56,7 @@ function stubFactoryWithRepository(sessions: FactoryUserSession[] = []) {
         ],
       }),
     ),
-    http.get(`${TEST_BASE_URL}/web/github/projects/${projectRepositoryId}/sessions`, () =>
+    http.get(`${TEST_BASE_URL}/web/source-control/projects/${projectRepositoryId}/sessions`, () =>
       HttpResponse.json({ sessions }),
     ),
     http.get(`${TEST_BASE_URL}/web/user-sessions/:sessionId`, ({ params }) => {
@@ -109,7 +109,7 @@ describe('User sessions creation', () => {
     const controller = trackControllerRequests();
     let sessionPosts = 0;
     server.use(
-      http.post(`${TEST_BASE_URL}/web/github/projects/${projectRepositoryId}/sessions`, () => {
+      http.post(`${TEST_BASE_URL}/web/source-control/projects/${projectRepositoryId}/sessions`, () => {
         sessionPosts += 1;
         return HttpResponse.json({ session: userSession() });
       }),
@@ -160,14 +160,14 @@ describe('User sessions creation', () => {
 
     expect(await screen.findByRole('button', { name: 'Fix login' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'feature-readable' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'New session' })).toHaveAttribute('title', 'New session');
+    expect(screen.getByRole('button', { name: 'New session' })).toBeInTheDocument();
     expect(screen.queryByText(opaqueSessionId)).not.toBeInTheDocument();
   });
 
   it('says the session list failed instead of claiming there are none', async () => {
     stubFactoryWithRepository();
     server.use(
-      http.get(`${TEST_BASE_URL}/web/github/projects/${projectRepositoryId}/sessions`, () =>
+      http.get(`${TEST_BASE_URL}/web/source-control/projects/${projectRepositoryId}/sessions`, () =>
         HttpResponse.json({ message: 'Nope' }, { status: 500 }),
       ),
     );

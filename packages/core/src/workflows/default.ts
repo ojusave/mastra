@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { TripWire } from '../agent/trip-wire';
 import type { ActorSignal } from '../auth/ee';
 import { RequestContext } from '../di';
@@ -6,7 +7,8 @@ import type { SerializedError } from '../error';
 import { getErrorFromUnknown } from '../error/utils.js';
 import type { PubSub } from '../events/pubsub';
 import type { ObservabilityContext, Span, SpanType, TracingPolicy } from '../observability';
-import { createObservabilityContext } from '../observability';
+import { createObservabilityContext, resolveExportedSpanId } from '../observability';
+import { MASTRA_AUTH_TOKEN_KEY } from '../request-context';
 import { deepEqual } from '../utils/deep-equal';
 import type { ExecutionGraph } from './execution-engine';
 import { ExecutionEngine } from './execution-engine';
@@ -29,7 +31,7 @@ import { executeSleep as executeSleepHandler, executeSleepUntil as executeSleepU
 import type { ExecuteStepParams } from './handlers/step';
 import { executeStep as executeStepHandler } from './handlers/step';
 import type { ConditionFunction, ConditionFunctionParams, Step } from './step';
-import { createMappingStep, createStepFromAgent, createStepFromTool } from './step-factories';
+import { createMappingStep, createStepFromAgent, createStepFromClassifier, createStepFromTool } from './step-factories';
 import type {
   FormattedWorkflowResult,
   DefaultEngineType,
@@ -61,20 +63,19 @@ export type ExecuteAgentParams = Omit<ExecuteStepParams, 'step'> & {
   entry: Extract<SingleStepEntry, { type: 'agent' }>;
 };
 export type ExecuteToolParams = Omit<ExecuteStepParams, 'step'> & { entry: Extract<SingleStepEntry, { type: 'tool' }> };
+export type ExecuteClassifierParams = Omit<ExecuteStepParams, 'step'> & {
+  entry: Extract<SingleStepEntry, { type: 'classifier' }>;
+};
 export type ExecuteMappingParams = Omit<ExecuteStepParams, 'step'> & {
   entry: Extract<SingleStepEntry, { type: 'mapping' }>;
 };
+
+const retryCountStorage = new AsyncLocalStorage<number>();
 
 /**
  * Default implementation of the ExecutionEngine
  */
 export class DefaultExecutionEngine extends ExecutionEngine {
-  /**
-   * The retryCounts map is used to keep track of the retry count for each step.
-   * The step id is used as the key and the retry count is the value.
-   */
-  protected retryCounts = new Map<string, number>();
-
   /**
    * Tracks the last workflow status this engine successfully persisted for a
    * given run. Populated by `persistStepUpdate` after each write.
@@ -106,29 +107,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     this.lastPersistedStatusByRun.delete(runId);
   }
 
-  /**
-   * Get or generate the retry count for a step.
-   * If the step id is not in the map, it will be added and the retry count will be 0.
-   * If the step id is in the map, it will return the retry count.
-   *
-   * @param stepId - The id of the step.
-   * @returns The retry count for the step.
-   */
-  getOrGenerateRetryCount(stepId: Step['id']) {
-    if (this.retryCounts.has(stepId)) {
-      const currentRetryCount = this.retryCounts.get(stepId) as number;
-      const nextRetryCount = currentRetryCount + 1;
-
-      this.retryCounts.set(stepId, nextRetryCount);
-
-      return nextRetryCount;
-    }
-
-    const retryCount = 0;
-
-    this.retryCounts.set(stepId, retryCount);
-
-    return retryCount;
+  /** Returns the current step's zero-based retry attempt, or zero outside an attempt. */
+  getOrGenerateRetryCount(_stepId: Step['id']) {
+    return retryCountStorage.getStore() ?? 0;
   }
 
   // =============================================================================
@@ -240,6 +221,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     operationId: string;
     skipEmits?: boolean;
   }): Promise<number> {
+    // Nothing to publish, so avoid spending a durable operation on a bare timestamp.
+    if (params.skipEmits) {
+      return Date.now();
+    }
     return this.wrapDurableOperation(params.operationId, async () => {
       const startedAt = Date.now();
       if (!params.skipEmits) {
@@ -323,6 +308,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       input?: unknown;
       entityType?: string;
       entityId?: string;
+      attributes?: Record<string, unknown>;
       tracingPolicy?: TracingPolicy;
       requestContext?: RequestContext;
     };
@@ -478,7 +464,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         await new Promise(resolve => setTimeout(resolve, params.delay));
       }
       try {
-        const result = await this.wrapDurableOperation(stepId, runStep);
+        const result = await retryCountStorage.run(i, () => this.wrapDurableOperation(stepId, runStep));
         return { ok: true, result };
       } catch (e) {
         const isNonRetryable = e instanceof MastraNonRetryableError;
@@ -676,13 +662,18 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * Used by durable execution engines to persist context across step replays.
    */
   serializeRequestContext(requestContext: RequestContext): Record<string, any> {
+    let obj: Record<string, any>;
     if (typeof requestContext.toJSON === 'function') {
-      return requestContext.toJSON();
+      obj = requestContext.toJSON();
+    } else {
+      obj = {};
+      requestContext.forEach((value, key) => {
+        obj[key] = value;
+      });
     }
-    const obj: Record<string, any> = {};
-    requestContext.forEach((value, key) => {
-      obj[key] = value;
-    });
+    // Never persist the framework-managed bearer token in durable snapshots.
+    // A resumed authenticated request supplies its own fresh live token.
+    delete obj[MASTRA_AUTH_TOKEN_KEY];
     return obj;
   }
 
@@ -794,9 +785,6 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     const { attempts = 0, delay = 0 } = retryConfig ?? {};
     const steps = graph.steps;
 
-    //clear retryCounts
-    this.retryCounts.clear();
-
     if (steps.length === 0) {
       const empty_graph_error = new MastraError({
         id: 'WORKFLOW_EXECUTE_EMPTY_GRAPH',
@@ -865,7 +853,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         const formattedResult = await this.fmtReturnValue<any>(
           params.pubsub,
           stepResults,
-          { status: 'canceled' } as any,
+          { status: 'canceled' },
           undefined,
           stepExecutionPath,
         );
@@ -955,12 +943,17 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           stepExecutionPath,
         )) as any;
 
-        // Capture tracing context for suspend to enable span linking on resume
+        // Capture tracing context for suspend to enable span linking on resume.
+        // On resume this spanId becomes the resumed span's parentSpanId, so it has to
+        // name a span that reached exporters — an internal/excluded workflow span is
+        // never stored, and the resumed span's exported children would inherit it and
+        // land as orphans. Undefined when nothing in the chain is exportable, which
+        // correctly makes those children trace roots instead.
         const persistTracingContext =
           result.status === 'suspended' && workflowSpan
             ? {
                 traceId: workflowSpan.traceId,
-                spanId: workflowSpan.id,
+                spanId: resolveExportedSpanId(workflowSpan),
                 parentSpanId: workflowSpan.getParentSpanId(),
               }
             : {};
@@ -1148,7 +1141,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       return stepResults.input;
     } else if (step.type === 'step') {
       return stepResults[step.step.id]?.output;
-    } else if (step.type === 'agent' || step.type === 'tool' || step.type === 'mapping') {
+    } else if (step.type === 'agent' || step.type === 'tool' || step.type === 'classifier' || step.type === 'mapping') {
       return stepResults[step.id]?.output;
     } else if (step.type === 'sleep' || step.type === 'sleepUntil') {
       return stepResults[step.id]?.output;
@@ -1212,13 +1205,44 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     return this.executeStep({ ...rest, step: { ...createStepFromTool(tool as any, entry.options), id: entry.id } });
   }
 
+  async executeClassifier(params: ExecuteClassifierParams): Promise<StepExecutionResult> {
+    const { entry, ...rest } = params;
+    let classifier = entry.classifier;
+    if (!classifier) {
+      try {
+        classifier = this.mastra?.getClassifierById(entry.classifierId);
+      } catch {
+        throw new Error(
+          `Classifier '${entry.classifierId}' not found for workflow step '${entry.id}'. Register it with Mastra or pass the classifier instance directly.`,
+        );
+      }
+    }
+    if (!classifier) {
+      throw new Error(
+        `Classifier '${entry.classifierId}' not found for workflow step '${entry.id}'. Register it with Mastra or pass the classifier instance directly.`,
+      );
+    }
+    return this.executeStep({
+      ...rest,
+      step: createStepFromClassifier(classifier as any, {
+        ...entry.options,
+        id: entry.id,
+      }),
+    });
+  }
+
   /**
    * Executes a declarative `mapping` step: builds the mapping step from the
    * declarative config/fn and runs it through the shared step runner.
    */
   async executeMapping(params: ExecuteMappingParams): Promise<StepExecutionResult> {
     const { entry, ...rest } = params;
-    return this.executeStep({ ...rest, step: createMappingStep(entry.id, entry.mapConfig) });
+    return this.executeStep({
+      ...rest,
+      step: createMappingStep(entry.id, entry.mapConfig),
+      entryDescription: entry.description,
+      entryMetadata: entry.metadata,
+    });
   }
 
   async executeParallel(params: ExecuteParallelParams): Promise<StepResult<any, any, any, any>> {

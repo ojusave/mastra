@@ -10,6 +10,7 @@ import type {
 
 import { PgDB, resolvePgConfig, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
+import { toPgJson } from '../../db/sanitize-json';
 import { runPrune, resolveTargets } from '../../retention';
 import { getSchemaName, getTableName } from '../utils';
 
@@ -41,8 +42,8 @@ export class ThreadStatePG extends ThreadStateStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, schemaName, skipDefaultIndexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, skipDefaultIndexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
   }
 
@@ -142,7 +143,7 @@ export class ThreadStatePG extends ThreadStateStorage {
 
   async setState<T = unknown>({ threadId, type, value }: { threadId: string; type: string; value: T }): Promise<void> {
     const now = new Date().toISOString();
-    const serialized = JSON.stringify(value ?? null);
+    const serialized = toPgJson(value ?? null);
     try {
       // Single-statement upsert: concurrent writers to the same slot resolve on
       // the primary key rather than racing a read-then-write. `createdAt` is

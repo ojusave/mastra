@@ -1,19 +1,24 @@
+import { DEFAULT_OM_MODEL_ID } from '@mastra/code-sdk/constants';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createFactoryStorageForTests } from '../storage/test-utils.js';
 import {
+  createSourceControlSessionLookup,
   ensureFactorySourceSession,
   hydrateFactorySession,
+  refreshFactorySessionMemorySettings,
   resolveFactoryDefaultModelId,
   resolveFactoryProjectForSession,
+  resolveFactorySourceControl,
   resolveFactorySourceRepository,
 } from './factory-session.js';
+import { DEFAULT_OBSERVATION_THRESHOLD, DEFAULT_REFLECTION_THRESHOLD } from './memory-settings-hydration.js';
 
 type FactorySessionHandle = Parameters<typeof hydrateFactorySession>[0];
 
-async function seedLinkedRepository(options?: { pinnedBranch?: string }) {
+async function seedLinkedRepository(options?: { pinnedBranch?: string; integrationId?: string }) {
   const seeded = await createFactoryStorageForTests();
-  const sourceControl = seeded.sourceControl.forIntegration('github');
+  const sourceControl = seeded.sourceControl.forIntegration(options?.integrationId ?? 'github');
   const project = await seeded.projects.create({ orgId: 'org-1', userId: 'user-1', input: { name: 'Mastra' } });
   const installation = await sourceControl.installations.upsert({
     orgId: 'org-1',
@@ -54,6 +59,67 @@ function createSessionDouble() {
   };
   return { session: session as unknown as FactorySessionHandle, double: session, calls };
 }
+
+describe('provider-aware source-control resolution', () => {
+  it("chooses the Factory's linked GitLab repository even when GitHub is also registered", async () => {
+    const { seeded, sourceControl: gitlab, project } = await seedLinkedRepository({ integrationId: 'gitlab' });
+    const github = seeded.sourceControl.forIntegration('github');
+
+    await expect(
+      resolveFactorySourceControl({
+        sourceControls: [github, gitlab],
+        orgId: 'org-1',
+        factoryProjectId: project.id,
+      }),
+    ).resolves.toBe(gitlab);
+  });
+
+  it('finds a GitLab session through the cross-provider lookup', async () => {
+    const { seeded, sourceControl: gitlab, project } = await seedLinkedRepository({ integrationId: 'gitlab' });
+    const github = seeded.sourceControl.forIntegration('github');
+    const session = await ensureFactorySourceSession({
+      sourceControl: gitlab,
+      orgId: 'org-1',
+      factoryProjectId: project.id,
+      branch: 'factory/gitlab-issue',
+    });
+    const sessions = createSourceControlSessionLookup([github, gitlab]);
+
+    await expect(sessions.getBySessionId(session.sessionId)).resolves.toMatchObject({
+      sessionId: session.sessionId,
+      orgId: 'org-1',
+    });
+  });
+
+  it('propagates connection-list storage failures instead of selecting another provider', async () => {
+    const { seeded, sourceControl: gitlab, project } = await seedLinkedRepository({ integrationId: 'gitlab' });
+    const github = seeded.sourceControl.forIntegration('github');
+    vi.spyOn(github.connections, 'list').mockRejectedValueOnce(new Error('connection storage unavailable'));
+
+    await expect(
+      resolveFactorySourceControl({
+        sourceControls: [github, gitlab],
+        orgId: 'org-1',
+        factoryProjectId: project.id,
+      }),
+    ).rejects.toThrow('connection storage unavailable');
+  });
+
+  it('propagates repository-list storage failures', async () => {
+    const { sourceControl, project } = await seedLinkedRepository({ integrationId: 'gitlab' });
+    vi.spyOn(sourceControl.projectRepositories, 'list').mockRejectedValueOnce(
+      new Error('repository storage unavailable'),
+    );
+
+    await expect(
+      resolveFactorySourceControl({
+        sourceControls: [sourceControl],
+        orgId: 'org-1',
+        factoryProjectId: project.id,
+      }),
+    ).rejects.toThrow('repository storage unavailable');
+  });
+});
 
 describe('ensureFactorySourceSession', () => {
   it('creates a source-control session on the requested branch', async () => {
@@ -111,6 +177,23 @@ describe('ensureFactorySourceSession', () => {
     expect(result.baseBranch).toBe('develop');
   });
 
+  it('attributes the session to attributeToUserId over the repo connector', async () => {
+    const { sourceControl, project } = await seedLinkedRepository();
+
+    const result = await ensureFactorySourceSession({
+      sourceControl,
+      orgId: 'org-1',
+      factoryProjectId: project.id,
+      branch: 'factory/issue-22254',
+      attributeToUserId: 'approver-1',
+    });
+
+    expect(result.userId).toBe('approver-1');
+    await expect(sourceControl.sessions.getBySessionId(result.sessionId)).resolves.toEqual(
+      expect.objectContaining({ userId: 'approver-1' }),
+    );
+  });
+
   it('rejects a factory project with no connection for this integration', async () => {
     const { seeded, project } = await seedLinkedRepository();
     const otherIntegration = seeded.sourceControl.forIntegration('gitlab');
@@ -141,7 +224,7 @@ describe('ensureFactorySourceSession', () => {
 });
 
 describe('hydrateFactorySession', () => {
-  it('applies stored memory settings and the factory default model', async () => {
+  it("applies the factory project's stored memory settings and the factory default model", async () => {
     const { session, double } = createSessionDouble();
     const memorySettings = {
       get: vi.fn(async () => ({
@@ -155,12 +238,12 @@ describe('hydrateFactorySession', () => {
 
     await hydrateFactorySession(session, {
       orgId: 'org-1',
-      userId: 'user-1',
+      factoryProjectId: 'proj-1',
       defaultModelId: 'anthropic/claude-opus-5',
       memorySettings: memorySettings as never,
     });
 
-    expect(memorySettings.get).toHaveBeenCalledWith({ orgId: 'org-1', userId: 'user-1' });
+    expect(memorySettings.get).toHaveBeenCalledWith({ orgId: 'org-1', userId: 'factory-project:proj-1' });
     expect(double.om.observer.switchModel).toHaveBeenCalledWith({ modelId: 'anthropic/claude-fable-5' });
     expect(double.om.reflector.switchModel).toHaveBeenCalledWith({ modelId: 'anthropic/claude-opus-5' });
     expect(double.state.set).toHaveBeenCalledWith({
@@ -174,10 +257,34 @@ describe('hydrateFactorySession', () => {
   it('leaves the session on its default model when the project has none', async () => {
     const { session, double } = createSessionDouble();
 
-    await hydrateFactorySession(session, { orgId: 'org-1', userId: 'user-1' });
+    await hydrateFactorySession(session, { orgId: 'org-1', factoryProjectId: 'proj-1' });
 
     expect(double.model.switch).not.toHaveBeenCalled();
-    expect(double.state.set).not.toHaveBeenCalled();
+    // The org seed is the one state write that always happens: knowledge
+    // capture scopes on it, and it must land even when nothing else does.
+    expect(double.state.set).toHaveBeenCalledWith({ factoryOrgId: 'org-1' });
+  });
+
+  it('resets to the built-in memory defaults when memory settings are omitted', async () => {
+    const { session, double } = createSessionDouble();
+
+    await hydrateFactorySession(session, { orgId: 'org-1', factoryProjectId: 'proj-1' });
+
+    expect(double.om.observer.switchModel).toHaveBeenCalledWith({ modelId: DEFAULT_OM_MODEL_ID });
+    expect(double.om.reflector.switchModel).toHaveBeenCalledWith({ modelId: DEFAULT_OM_MODEL_ID });
+    expect(double.state.set).toHaveBeenCalledWith({
+      observationThreshold: DEFAULT_OBSERVATION_THRESHOLD,
+      reflectionThreshold: DEFAULT_REFLECTION_THRESHOLD,
+    });
+  });
+
+  it('marks the session unresolved when the caller has no organization', async () => {
+    const { session, double } = createSessionDouble();
+
+    await hydrateFactorySession(session, { orgId: '  ', factoryProjectId: 'proj-1' });
+
+    expect(double.state.set).toHaveBeenCalledWith({ factoryOrgUnresolved: true });
+    expect(double.state.set).not.toHaveBeenCalledWith(expect.objectContaining({ factoryOrgId: expect.anything() }));
   });
 
   it('keeps going when the default model is unknown', async () => {
@@ -186,7 +293,7 @@ describe('hydrateFactorySession', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await expect(
-      hydrateFactorySession(session, { orgId: 'org-1', userId: 'user-1', defaultModelId: 'openai/retired' }),
+      hydrateFactorySession(session, { orgId: 'org-1', factoryProjectId: 'proj-1', defaultModelId: 'openai/retired' }),
     ).resolves.toBeUndefined();
 
     expect(warn).toHaveBeenCalledWith('[Factory Start] Failed to apply factory default model', {
@@ -203,7 +310,7 @@ describe('hydrateFactorySession', () => {
 
     await hydrateFactorySession(session, {
       orgId: 'org-1',
-      userId: 'user-1',
+      factoryProjectId: 'proj-1',
       defaultModelId: 'anthropic/claude-opus-5',
       memorySettings: memorySettings as never,
     });
@@ -212,6 +319,57 @@ describe('hydrateFactorySession', () => {
       error: 'storage down',
     });
     expect(double.model.switch).toHaveBeenCalledWith({ modelId: 'anthropic/claude-opus-5' });
+    warn.mockRestore();
+  });
+});
+
+describe('refreshFactorySessionMemorySettings', () => {
+  it("reapplies the project's current OM models to a reused session", async () => {
+    const { session, double } = createSessionDouble();
+    const memorySettings = {
+      get: vi.fn(async () => ({
+        observerModelId: 'anthropic/claude-fable-5',
+        reflectorModelId: 'anthropic/claude-opus-5',
+        observationThreshold: 3,
+        reflectionThreshold: 7,
+        observeAttachments: true,
+      })),
+    };
+    const projects = { get: vi.fn(async () => ({ defaultModelId: 'anthropic/claude-opus-5' })) };
+
+    await refreshFactorySessionMemorySettings(session, {
+      orgId: 'org-1',
+      factoryProjectId: 'proj-1',
+      projects: projects as never,
+      memorySettings: memorySettings as never,
+    });
+
+    expect(memorySettings.get).toHaveBeenCalledWith({ orgId: 'org-1', userId: 'factory-project:proj-1' });
+    expect(double.om.observer.switchModel).toHaveBeenCalledWith({ modelId: 'anthropic/claude-fable-5' });
+    expect(double.om.reflector.switchModel).toHaveBeenCalledWith({ modelId: 'anthropic/claude-opus-5' });
+    // Reuse only reapplies OM/memory settings — it must not touch the run model.
+    expect(double.model.switch).not.toHaveBeenCalled();
+  });
+
+  it('swallows and logs a settings lookup failure so the reused run still proceeds', async () => {
+    const { session } = createSessionDouble();
+    const memorySettings = { get: vi.fn(async () => Promise.reject(new Error('storage down'))) };
+    const projects = { get: vi.fn(async () => null) };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(
+      refreshFactorySessionMemorySettings(session, {
+        orgId: 'org-1',
+        factoryProjectId: 'proj-1',
+        projects: projects as never,
+        memorySettings: memorySettings as never,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalledWith(
+      '[Factory dispatch] Failed to reapply observational-memory settings on session reuse',
+      { error: 'storage down' },
+    );
     warn.mockRestore();
   });
 });

@@ -17,9 +17,13 @@
  */
 
 import type { CredentialTenant as SdkCredentialTenant } from '@mastra/code-sdk/agents/credential-resolver';
-import { setCredentialStoreProvider } from '@mastra/code-sdk/agents/credential-resolver';
+import {
+  resolveTenantFromRequestContext,
+  setCredentialStoreProvider,
+} from '@mastra/code-sdk/agents/credential-resolver';
 import { getOAuthProvider } from '@mastra/code-sdk/auth/storage';
 import type { AuthCredential, CredentialStore } from '@mastra/code-sdk/auth/types';
+import type { RequestContext } from '@mastra/core/request-context';
 import type { MiddlewareHandler } from 'hono';
 
 import { isOAuthCredentialExpired } from '../storage/domains/credentials/base.js';
@@ -37,15 +41,17 @@ export class TenantCredentialStore implements CredentialStore {
   readonly allowEnvironmentFallback = false;
   readonly #orgId: string;
   readonly #userId: string;
+  readonly #orgFirst: boolean;
   readonly #credentials: ModelCredentialsStorage | undefined;
   #snapshot = new Map<string, AuthCredential>();
   #fetchedAt = 0;
   #hydrating: Promise<void> | undefined;
 
-  constructor(orgId: string, userId: string, credentials: ModelCredentialsStorage | undefined) {
+  constructor(orgId: string, userId: string, credentials: ModelCredentialsStorage | undefined, orgFirst = false) {
     this.#orgId = orgId;
     this.#userId = userId;
     this.#credentials = credentials;
+    this.#orgFirst = orgFirst;
   }
 
   /** Hydrate the snapshot when stale; coalesces concurrent callers. */
@@ -62,11 +68,13 @@ export class TenantCredentialStore implements CredentialStore {
     if (!storage) return; // Keep the last tenant-scoped snapshot.
     const records = await storage.listCredentials(this.#orgId, this.#userId);
     const next = new Map<string, AuthCredential>();
-    // Org rows first so user rows overwrite them (user > org precedence).
-    for (const record of records.filter(r => r.scope === 'org')) {
+    // Lower-precedence rows first so higher-precedence rows overwrite them
+    // (user > org normally; org > user for org-first automated runs).
+    const [under, over] = this.#orgFirst ? (['user', 'org'] as const) : (['org', 'user'] as const);
+    for (const record of records.filter(r => r.scope === under)) {
       next.set(record.provider, record.credential);
     }
-    for (const record of records.filter(r => r.scope === 'user')) {
+    for (const record of records.filter(r => r.scope === over)) {
       next.set(record.provider, record.credential);
     }
     this.#snapshot = next;
@@ -108,7 +116,12 @@ export class TenantCredentialStore implements CredentialStore {
       return undefined;
     }
 
-    const resolved = await storage.resolveCredential(this.#orgId, this.#userId, provider);
+    const resolved = await storage.resolveCredential(
+      this.#orgId,
+      this.#userId,
+      provider,
+      this.#orgFirst ? 'org' : 'user',
+    );
     if (!resolved) {
       this.#snapshot.delete(provider);
       return undefined;
@@ -145,17 +158,19 @@ export class TenantCredentialStore implements CredentialStore {
 }
 
 const tenantStores = new Map<string, TenantCredentialStore>();
+let registeredCredentials: ModelCredentialsStorage | undefined;
 
 function storeFor(tenant: SdkCredentialTenant, credentials: ModelCredentialsStorage): TenantCredentialStore {
   const orgId = tenantOrgId(tenant);
-  const key = `${orgId}\u0000${tenant.userId}`;
+  const orgFirst = tenant.orgFirst === true;
+  const key = `${orgId}\u0000${tenant.userId}\u0000${orgFirst ? 'org-first' : 'user-first'}`;
   let store = tenantStores.get(key);
   if (!store) {
     if (tenantStores.size >= MAX_CACHED_TENANTS) {
       const oldest = tenantStores.keys().next().value;
       if (oldest !== undefined) tenantStores.delete(oldest);
     }
-    store = new TenantCredentialStore(orgId, tenant.userId, credentials);
+    store = new TenantCredentialStore(orgId, tenant.userId, credentials, orgFirst);
     tenantStores.set(key, store);
   }
   return store;
@@ -168,12 +183,26 @@ function storeFor(tenant: SdkCredentialTenant, credentials: ModelCredentialsStor
  * the `loadStoredApiKeysIntoEnv` env side-channel.
  */
 export function registerTenantCredentialResolver(credentials: ModelCredentialsStorage): void {
+  registeredCredentials = credentials;
   setCredentialStoreProvider(tenant => storeFor(tenant, credentials));
+}
+
+/**
+ * Prime the tenant stores for a request context built outside the web layer,
+ * such as a webhook-triggered session run. The auth middleware does this for
+ * HTTP requests; a run that starts without one would otherwise resolve its
+ * model against an empty snapshot and fail closed. No-op before registration.
+ */
+export async function primeTenantCredentialsForRequestContext(requestContext: RequestContext): Promise<void> {
+  const tenant = resolveTenantFromRequestContext(requestContext);
+  if (!tenant || !registeredCredentials) return;
+  await primeTenantCredentials({ tenant, credentials: registeredCredentials });
 }
 
 /** Test hook: clear registration and cached tenant snapshots. */
 export function resetTenantCredentialResolverForTests(): void {
   setCredentialStoreProvider(undefined);
+  registeredCredentials = undefined;
   tenantStores.clear();
 }
 
@@ -185,7 +214,8 @@ export function resetTenantCredentialResolverForTests(): void {
  */
 export function invalidateTenantCredentialSnapshots(tenant: { orgId: string; userId?: string }): void {
   if (tenant.userId) {
-    tenantStores.delete(`${tenant.orgId}\u0000${tenant.userId}`);
+    tenantStores.delete(`${tenant.orgId}\u0000${tenant.userId}\u0000user-first`);
+    tenantStores.delete(`${tenant.orgId}\u0000${tenant.userId}\u0000org-first`);
     return;
   }
   for (const key of tenantStores.keys()) {
@@ -194,10 +224,10 @@ export function invalidateTenantCredentialSnapshots(tenant: { orgId: string; use
 }
 
 /**
- * Middleware mounted after the web auth gate: primes the caller's credential
- * snapshot so the request's first model call sees their credentials without an
- * async seam in model resolution. Cheap when fresh (TTL check), best-effort
- * when not — a failed hydrate falls back to env vars, never blocks a request.
+ * Middleware mounted after the web auth gate: primes both credential precedence
+ * modes so the request's first model call can resolve user → organization when
+ * `orgFirst` is false or organization → user when `orgFirst` is true. Cheap when
+ * fresh because each store has a TTL.
  */
 export async function primeTenantCredentials({
   tenant,
@@ -206,7 +236,10 @@ export async function primeTenantCredentials({
   tenant: SdkCredentialTenant;
   credentials: ModelCredentialsStorage;
 }): Promise<void> {
-  await storeFor(tenant, credentials).ensureFresh();
+  await Promise.all([
+    storeFor({ ...tenant, orgFirst: false }, credentials).ensureFresh(),
+    storeFor({ ...tenant, orgFirst: true }, credentials).ensureFresh(),
+  ]);
 }
 
 export function createTenantCredentialPrimer({
@@ -220,9 +253,13 @@ export function createTenantCredentialPrimer({
     const tenant = auth.tenant(c);
     if (tenant) {
       try {
-        await storeFor(tenant, credentials).ensureFresh();
-      } catch {
-        // Fail open: model calls fall back to env credentials.
+        await primeTenantCredentials({ tenant, credentials });
+      } catch (error) {
+        console.warn('[factory] Failed to prime tenant model credentials', {
+          orgId: tenant.orgId,
+          userId: tenant.userId,
+          error,
+        });
       }
     }
     await next();
