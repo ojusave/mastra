@@ -59,6 +59,7 @@ export class RenderExecutionEngine extends DefaultExecutionEngine {
               params.executionContext.executionPath,
               params.executionContext.foreachIndex ?? null,
               params.step.id,
+              params.iterationCount ?? null,
             ]),
             input: json(context.inputData),
             state: json(context.state),
@@ -101,5 +102,14 @@ export class RenderExecutionEngine extends DefaultExecutionEngine {
   }
   override executeForeach(params: Parameters<DefaultExecutionEngine['executeForeach']>[0]) {
     return readOnly.run(true, () => super.executeForeach(params));
+  }
+  override executeLoop(params: Parameters<DefaultExecutionEngine['executeLoop']>[0]) {
+    return super.executeLoop({
+      ...params,
+      entry: {
+        ...params.entry,
+        condition: (context, ...rest) => params.entry.condition(pureContext(context), ...rest),
+      },
+    });
   }
 }

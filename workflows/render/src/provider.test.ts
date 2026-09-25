@@ -16,9 +16,11 @@ function harness(options: Partial<RenderOptions> = {}) {
   let tasks: ReadonlyMap<string, TaskDefinition<[unknown], unknown>>;
   const runs = new Map<string, ProviderRun>();
   const dispatched: string[] = [];
+  const executions: unknown[] = [];
   const context: TaskContext = {
     async run(definition, ...args) {
       dispatched.push(definition.name);
+      executions.push(structuredClone(args[0]));
       return structuredClone(await definition.func(context, ...structuredClone(args)));
     },
   };
@@ -60,6 +62,7 @@ function harness(options: Partial<RenderOptions> = {}) {
     ...factories,
     transport,
     dispatched,
+    executions,
     runs,
     register(workflow: AnyWorkflow) {
       const mastra = new Mastra({ workflows: { workflow }, logger: false });
@@ -70,6 +73,132 @@ function harness(options: Partial<RenderOptions> = {}) {
 }
 
 describe('provider feasibility and graph behavior', () => {
+  it.each(['dowhile', 'dountil'] as const)(
+    'executes %s iterations as distinct children with updated state',
+    async kind => {
+      const h = harness();
+      const stateSchema = z.object({ rounds: z.number() });
+      const observed: unknown[] = [];
+      const step = h.createStep({
+        id: 'revise',
+        inputSchema: z.number(),
+        outputSchema: z.number(),
+        stateSchema,
+        execute: async ({ inputData, state, setState, requestContext, getInitData }) => {
+          expect(getInitData()).toBe(0);
+          expect(state.rounds).toBe(inputData);
+          expect(requestContext.get('locale')).toBe(String(inputData));
+          await setState({ rounds: state.rounds + 1 });
+          requestContext.set('locale', String(inputData + 1));
+          return inputData + 1;
+        },
+      });
+      const workflow = h
+        .createWorkflow({ id: randomUUID(), inputSchema: z.number(), outputSchema: z.number(), stateSchema })
+        [kind](step, async ({ inputData, iterationCount, state, requestContext, getStepResult }) => {
+          observed.push([inputData, iterationCount, state.rounds, requestContext.get('locale'), getStepResult(step)]);
+          return kind === 'dowhile' ? inputData < 3 : inputData >= 3;
+        })
+        .commit();
+      const tasks = h.register(workflow);
+      const result = await (
+        await workflow.createRun()
+      ).start({
+        inputData: 0,
+        initialState: { rounds: 0 },
+        requestContext: new RequestContext<unknown>([['locale', '0']]),
+      });
+      expect(result.status).toBe('success');
+      if (result.status === 'success') expect(result.result).toBe(3);
+      expect(observed).toEqual([
+        [1, 1, 1, '1', 1],
+        [2, 2, 2, '2', 2],
+        [3, 3, 3, '3', 3],
+      ]);
+      expect(tasks.size).toBe(2);
+      expect(h.dispatched).toHaveLength(3);
+      expect(new Set(h.dispatched).size).toBe(1);
+      expect(new Set(h.executions.map(value => (value as { executionKey: string }).executionKey)).size).toBe(3);
+    },
+  );
+
+  it.each(['dowhile', 'dountil'] as const)('runs %s at least once when its condition stops immediately', async kind => {
+    const h = harness();
+    const step = h.createStep({
+      id: 'increment',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      execute: async ({ inputData }) => inputData + 1,
+    });
+    const workflow = h
+      .createWorkflow({ id: randomUUID(), inputSchema: z.number(), outputSchema: z.number() })
+      [kind](step, async () => kind === 'dountil')
+      .commit();
+    h.register(workflow);
+    const result = await (await workflow.createRun()).start({ inputData: 0 });
+    expect(result.status).toBe('success');
+    if (result.status === 'success') expect(result.result).toBe(1);
+    expect(h.dispatched).toHaveLength(1);
+  });
+
+  it('stops the loop and subsequent steps after a child fails', async () => {
+    const h = harness();
+    let conditions = 0;
+    const step = h.createStep({
+      id: 'fails-second-round',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      execute: async ({ inputData }) => {
+        if (inputData === 1) throw new Error('second round failed');
+        return inputData + 1;
+      },
+    });
+    const after = h.createStep({
+      id: 'after-loop',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      execute: async () => {
+        throw new Error('must not run');
+      },
+    });
+    const workflow = h
+      .createWorkflow({ id: randomUUID(), inputSchema: z.number(), outputSchema: z.number() })
+      .dountil(step, async ({ inputData }) => {
+        conditions++;
+        return inputData >= 3;
+      })
+      .then(after)
+      .commit();
+    h.register(workflow);
+    const result = await (await workflow.createRun()).start({ inputData: 0 });
+    expect(result.status).toBe('failed');
+    if (result.status === 'failed') expect(result.error.message).toContain('second round failed');
+    expect(conditions).toBe(1);
+    expect(h.dispatched).toHaveLength(2);
+  });
+
+  it('guards request-context mutation in loop conditions', async () => {
+    const h = harness();
+    const step = h.createStep({
+      id: 'identity',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      execute: async ({ inputData }) => inputData,
+    });
+    const workflow = h
+      .createWorkflow({ id: randomUUID(), inputSchema: z.number(), outputSchema: z.number() })
+      .dountil(step, async ({ requestContext }) => {
+        requestContext.set('locale', 'fr');
+        return true;
+      })
+      .commit();
+    h.register(workflow);
+    const result = await (await workflow.createRun()).start({ inputData: 0 });
+    expect(result.status).toBe('failed');
+    if (result.status === 'failed') expect(result.error.message).toContain('mutation');
+    expect(h.dispatched).toHaveLength(1);
+  });
+
   it('executes the root locally and business steps through the child context', async () => {
     const h = harness();
     const first = h.createStep({

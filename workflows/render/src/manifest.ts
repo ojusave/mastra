@@ -71,8 +71,12 @@ export function compileManifest(
         return { type: entry.type, children: entry.steps.map(walk) };
       case 'foreach':
         return frameworkJson({ type: entry.type, child: walk(entry.step), options: entry.opts });
+      case 'loop':
+        return { type: entry.type, child: walk(entry.step), loopType: entry.loopType };
       default:
-        return unsupported(`graph entry ${entry.type}; use explicit steps, mappings, parallel, branch or foreach`);
+        return unsupported(
+          `graph entry ${entry.type}; use explicit steps, mappings, parallel, branch, foreach or loops`,
+        );
     }
   };
   const graph = workflow.stepGraph.map(walk);

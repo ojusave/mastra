@@ -134,4 +134,51 @@ export const workflow = adapter
   .map(async ({ inputData }) => inputData)
   .then(finish)
   .commit();
-export const mastra = new Mastra({ workflows: { workflow }, storage, logger: false });
+const loopSchema = z.object({
+  audit: z.string().regex(/^[a-z0-9-]+$/),
+  round: z.number().int().min(0),
+  fail: z.enum(['none', 'once', 'always']),
+  pids: z.array(z.number()),
+  delayMs: z.number().int().min(0).max(60000),
+});
+const loopStateSchema = z.object({ rounds: z.number() });
+const revise = adapter.createStep({
+  id: 'revise-round',
+  inputSchema: loopSchema,
+  outputSchema: loopSchema,
+  stateSchema: loopStateSchema,
+  render: { retry: { maxRetries: 1, waitDurationMs: 10, backoffScaling: 1 } },
+  execute: async ({ inputData, state, setState }) => {
+    const round = inputData.round + 1;
+    audit(inputData.audit, `round-${round}`);
+    if (state.rounds !== inputData.round) throw new Error('Loop state did not follow the previous iteration');
+    if (
+      round === 2 &&
+      (inputData.fail === 'always' || (inputData.fail === 'once' && firstAttempt(`${inputData.audit}-loop`)))
+    ) {
+      throw new Error('Injected loop child failure');
+    }
+    await new Promise(resolve => setTimeout(resolve, inputData.delayMs));
+    await setState({ rounds: round });
+    return { ...inputData, round, pids: [...inputData.pids, process.pid] };
+  },
+});
+function makeLoopWorkflow(kind: 'dowhile' | 'dountil') {
+  return adapter
+    .createWorkflow({
+      id: `distributed-${kind}`,
+      inputSchema: loopSchema,
+      outputSchema: loopSchema,
+      stateSchema: loopStateSchema,
+    })
+    [kind](revise, async ({ inputData, iterationCount, state }) => {
+      if (iterationCount !== inputData.round || state.rounds !== inputData.round) {
+        throw new Error('Loop condition did not receive the current iteration');
+      }
+      return kind === 'dowhile' ? inputData.round < 3 : inputData.round >= 3;
+    })
+    .commit();
+}
+export const whileWorkflow = makeLoopWorkflow('dowhile');
+export const untilWorkflow = makeLoopWorkflow('dountil');
+export const mastra = new Mastra({ workflows: { workflow, whileWorkflow, untilWorkflow }, storage, logger: false });
